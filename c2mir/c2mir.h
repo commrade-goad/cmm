@@ -33,4 +33,6 @@ void c2mir_finish (MIR_context_t ctx);
 int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *),
                    void *getc_data, const char *source_name, FILE *output_file);
 
+const char *eval_template (const char *str);
+
 #endif

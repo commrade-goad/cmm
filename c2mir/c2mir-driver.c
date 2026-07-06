@@ -301,6 +301,7 @@ static struct input curr_input;
 DEF_VARR (input_t);
 static VARR (input_t) * inputs_to_compile;
 static int template_mode = FALSE;
+static const char *template_output_file = NULL;
 
 #define STRINGIFY(v) #v
 #define STRING(v) STRINGIFY (v)
@@ -389,6 +390,12 @@ static void init_options (int argc, char *argv[]) {
       VARR_PUSH (macro_command_t, macro_commands, macro_command);
     } else if (strcmp (argv[i], "-t") == 0) {
       template_mode = TRUE;
+    } else if (strcmp (argv[i], "-to") == 0) {
+      if (i + 1 >= argc) {
+        fprintf (stderr, "-to requires an argument -- goodbye\n");
+        exit (1);
+      }
+      template_output_file = argv[++i];
     } else if (strcmp (argv[i], "-i") == 0) {
       VARR_PUSH (char_ptr_t, source_file_names, STDIN_SOURCE_NAME);
     } else if (strcmp (argv[i], "-ei") == 0 || strcmp (argv[i], "-eg") == 0
@@ -418,7 +425,9 @@ static void init_options (int argc, char *argv[]) {
                argv[0]);
       fprintf (stderr, "\n");
       fprintf (stderr, "  -v, -d -- output work, parser debug info\n");
+      fprintf (stderr, "   -expand-tag -- to use custom expand tag\n");
       fprintf (stderr, "  -t -- force template mode\n");
+      fprintf (stderr, "  -to file -- write template output to file (implies -t)\n");
       fprintf (stderr, "  -dg[level] -- output given (or max) level MIR-generator debug info\n");
       fprintf (stderr, "  -E -- output C preprocessed code into stdout\n");
       fprintf (stderr, "  -Dname[=value], -Uname -- predefine or unpredefine macros\n");
@@ -447,6 +456,7 @@ static void init_options (int argc, char *argv[]) {
   options.include_dirs = VARR_ADDR (char_ptr_t, headers);
   options.macro_commands_num = VARR_LENGTH (macro_command_t, macro_commands);
   options.macro_commands = VARR_ADDR (macro_command_t, macro_commands);
+  if (template_output_file != NULL) template_mode = TRUE;
   if (!C2MIR_PARALLEL || threads_num <= 1) threads_num = 0;
 }
 
@@ -776,20 +786,11 @@ static void db_append (dyn_buf_t *b, const char *s) { db_append_n (b, s, strlen 
 
 static int is_ident_char (int c) { return isalnum ((unsigned char) c) || c == '_'; }
 
-/* Fast pre-check: does the source contain "#expand" at all? If not, the
- * caller should skip templating entirely and compile the file as-is. */
-static int contains_expand (const uint8_t *code, size_t len) {
-  if (code == NULL || len < expand_tag_len) return FALSE;
-  for (size_t i = 0; i + expand_tag_len <= len; i++)
-    if (memcmp (code + i, expand_tag, expand_tag_len) == 0) return TRUE;
-  return FALSE;
-}
-
 /* Escape a run of literal (non-#expand) text into a C string literal and
  * append `tmpl_emit("...");` to the body buffer. */
 static void emit_literal_text (dyn_buf_t *body, const char *text, size_t len) {
   if (len == 0) return;
-  db_append (body, "  tmpl_emit (\"");
+  db_append (body, "  __tmpl_emit (\"");
   for (size_t i = 0; i < len; i++) {
     unsigned char c = (unsigned char) text[i];
     switch (c) {
@@ -802,7 +803,7 @@ static void emit_literal_text (dyn_buf_t *body, const char *text, size_t len) {
     default: db_append_n (body, (const char *) &c, 1); break;
     }
   }
-  db_append (body, "\");\n");
+  db_append (body, "\", FD);\n");
 }
 
 /* Compute the 1-based source line number of `offset` within `code`. Used to
@@ -948,15 +949,16 @@ static uint8_t *expand_templates (const uint8_t *code, size_t code_len, size_t *
   emit_literal_text (&body, (const char *) literal_start, (size_t) (end - literal_start));
 
   db_append (&out, "#include <stdio.h>\n#include <string.h>\n\n");
+  db_append (&out, "#ifndef render\n#define render(...) fprintf(FD, __VA_ARGS__)\n#endif\n\n");
   db_append_n (&out, prelude.data, prelude.len);
-  db_append (&out, "\nstatic void tmpl_emit (const char *s) { fputs (s, stdout); }\n\n");
-  db_append (&out, "static void tmpl_main (void) {\n");
+  db_append (&out, "\nstatic void __tmpl_emit (const char *s, FILE *FD) { fputs (s, FD); }\n\n");
+  db_append (&out, "static void __tmpl_main (FILE *FD) {\n");
   db_append_n (&out, body.data, body.len);
   db_append (&out, "}\n\n");
   db_append (&out,
              "int main (int argc, char *argv[], char *env[]) {\n"
              "  (void) argc; (void) argv; (void) env;\n"
-             "  tmpl_main ();\n"
+             "  __tmpl_main (stdout);\n"
              "  return 0;\n"
              "}\n");
 
@@ -965,6 +967,85 @@ static uint8_t *expand_templates (const uint8_t *code, size_t code_len, size_t *
 
   *out_len = out.len;
   return (uint8_t *) out.data;
+}
+
+/* Evaluate a template string and return the expanded output.
+   The returned string is malloc-allocated; caller must free() it.
+   Returns NULL on failure. */
+const char *eval_template (const char *str) {
+  size_t code_len;
+  uint8_t *code;
+  MIR_context_t ctx;
+  MIR_module_t module;
+  MIR_item_t func, tmpl_main_func = NULL;
+  MIR_val_t val;
+  struct input temp_input;
+  struct c2mir_options opts;
+  char *buf;
+  size_t buf_size;
+  FILE *mem;
+
+  if (str == NULL) return NULL;
+
+  code = expand_templates ((const uint8_t *) str, strlen (str), &code_len, "<template>");
+  if (code == NULL) return NULL;
+
+  ctx = MIR_init ();
+  c2mir_init (ctx);
+
+  memset (&opts, 0, sizeof (opts));
+  opts.message_file = stderr;
+
+  temp_input.code = code;
+  temp_input.code_len = code_len;
+  temp_input.curr_char = 0;
+  temp_input.input_name = "<template>";
+  temp_input.code_container = NULL;
+
+  if (!c2mir_compile (ctx, &opts, t_getc, &temp_input, "<template>", NULL)) {
+    MIR_free (&default_alloc, code);
+    c2mir_finish (ctx);
+    MIR_finish (ctx);
+    return NULL;
+  }
+
+  for (module = DLIST_HEAD (MIR_module_t, *MIR_get_module_list (ctx)); module != NULL;
+       module = DLIST_NEXT (MIR_module_t, module)) {
+    for (func = DLIST_HEAD (MIR_item_t, module->items); func != NULL;
+         func = DLIST_NEXT (MIR_item_t, func))
+      if (func->item_type == MIR_func_item && strcmp (func->u.func->name, "__tmpl_main") == 0)
+        tmpl_main_func = func;
+    MIR_load_module (ctx, module);
+  }
+
+  if (tmpl_main_func == NULL) {
+    MIR_free (&default_alloc, code);
+    c2mir_finish (ctx);
+    MIR_finish (ctx);
+    return NULL;
+  }
+
+  buf = NULL;
+  buf_size = 0;
+  mem = open_memstream (&buf, &buf_size);
+  if (mem == NULL) {
+    MIR_free (&default_alloc, code);
+    c2mir_finish (ctx);
+    MIR_finish (ctx);
+    return NULL;
+  }
+
+  open_std_libs ();
+  MIR_link (ctx, MIR_set_interp_interface, import_resolver);
+  MIR_interp (ctx, tmpl_main_func, &val, 1, (MIR_val_t){.a = mem});
+  close_std_libs ();
+
+  fclose (mem);
+  MIR_free (&default_alloc, code);
+  c2mir_finish (ctx);
+  MIR_finish (ctx);
+
+  return buf; /* malloc-allocated by open_memstream */
 }
 
 /* ADDITION END */
@@ -1097,7 +1178,7 @@ int main (int argc, char *argv[], char *env[]) {
       /* >>> NEW: template-expand this source before compiling, but only if
        * it actually contains #expand{} blocks. Plain C files pass through
        * completely untouched. <<< */
-      if (curr_input.code != NULL && (contains_expand (curr_input.code, curr_input.code_len) || template_mode == TRUE )) {
+      if (curr_input.code != NULL && template_mode == TRUE ) {
         size_t new_len;
         uint8_t *expanded
           = expand_templates (curr_input.code, curr_input.code_len, &new_len, curr_input.input_name);
@@ -1138,15 +1219,80 @@ int main (int argc, char *argv[], char *env[]) {
       sort_modules (main_ctx);
     }
 #endif
+    MIR_item_t tmpl_main_func = NULL;
     for (module = DLIST_HEAD (MIR_module_t, *MIR_get_module_list (main_ctx)); module != NULL;
          module = DLIST_NEXT (MIR_module_t, module)) {
       for (func = DLIST_HEAD (MIR_item_t, module->items); func != NULL;
            func = DLIST_NEXT (MIR_item_t, func))
-        if (func->item_type == MIR_func_item && strcmp (func->u.func->name, "main") == 0)
-          main_func = func;
+        if (func->item_type == MIR_func_item) {
+          if (strcmp (func->u.func->name, "main") == 0)      main_func = func;
+          if (strcmp (func->u.func->name, "__tmpl_main") == 0) tmpl_main_func = func;
+        }
       MIR_load_module (main_ctx, module);
     }
-    if (main_func == NULL) {
+    if (template_mode && tmpl_main_func != NULL) {
+      /* Template execution path: call tmpl_main(FILE*) directly */
+      FILE *template_out = stdout;
+      if (template_output_file != NULL) {
+        template_out = fopen (template_output_file, "wb");
+        if (template_out == NULL) {
+          fprintf (stderr, "cannot create file %s\n", template_output_file);
+          result_code = 1;
+          goto skip_template_exec;
+        }
+      }
+      open_std_libs ();
+      MIR_load_external (main_ctx, "abort", fancy_abort);
+      MIR_load_external (main_ctx, "_MIR_flush_code_cache", _MIR_flush_code_cache);
+      start_time = real_usec_time ();
+      if (interp_exec_p) {
+        if (options.verbose_p)
+          fprintf (stderr, "MIR link interp start  -- %.0f usec\n", real_usec_time () - start_time);
+        MIR_link (main_ctx, MIR_set_interp_interface, import_resolver);
+        if (options.verbose_p)
+          fprintf (stderr, "MIR Link finish        -- %.0f usec\n", real_usec_time () - start_time);
+        start_time = real_usec_time ();
+        MIR_interp (main_ctx, tmpl_main_func, &val, 1,
+                    (MIR_val_t){.a = template_out});
+        result_code = (int) val.i;
+        if (options.verbose_p) {
+          fprintf (stderr, "  execution       -- %.0f usec\n", real_usec_time () - start_time);
+          fprintf (stderr, "exit code: %lu\n", (long unsigned) result_code);
+        }
+      } else {
+        if (options.verbose_p)
+          fprintf (stderr, "MIR gen init start         -- %.0f usec\n",
+                   real_usec_time () - start_time);
+        MIR_gen_init (main_ctx);
+        if (options.verbose_p)
+          fprintf (stderr, "MIR gen init finish         -- %.0f usec\n",
+                   real_usec_time () - start_time);
+        if (optimize_level >= 0) MIR_gen_set_optimize_level (main_ctx, (unsigned) optimize_level);
+        if (gen_debug_level >= 0) {
+          MIR_gen_set_debug_file (main_ctx, stderr);
+          MIR_gen_set_debug_level (main_ctx, gen_debug_level);
+        }
+        MIR_link (main_ctx,
+                  gen_exec_p        ? MIR_set_gen_interface
+                  : lazy_gen_exec_p ? MIR_set_lazy_gen_interface
+                                    : MIR_set_lazy_bb_gen_interface,
+                  import_resolver);
+        if (options.verbose_p)
+          fprintf (stderr, "MIR link finish        -- %.0f usec\n", real_usec_time () - start_time);
+        {
+          void (*tmpl_fn) (FILE *) = (void (*) (FILE *)) tmpl_main_func->addr;
+          start_time = real_usec_time ();
+          tmpl_fn (template_out);
+          if (options.verbose_p) {
+            fprintf (stderr, "  execution       -- %.0f msec\n",
+                     (real_usec_time () - start_time) / 1000.0);
+          }
+        }
+        MIR_gen_finish (main_ctx);
+      }
+      if (template_out != stdout) fclose (template_out);
+    skip_template_exec:;
+    } else if (main_func == NULL) {
       fprintf (stderr, "cannot link program w/o main function\n");
       result_code = 1;
     } else if (!interp_exec_p && !gen_exec_p && !lazy_gen_exec_p && !lazy_bb_gen_exec_p) {

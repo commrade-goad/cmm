@@ -62,9 +62,9 @@ endif()
 target_link_libraries(mir_shared PRIVATE mir)
 
 # ------------------ C2M --------------------------
-add_executable (c2m "c2mir/c2mir-driver.c")
-target_include_directories(c2m PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(c2m mir ${CMAKE_DL_LIBS} )
+add_executable (cmm "c2mir/c2mir-driver.c")
+target_include_directories(cmm PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(cmm mir ${CMAKE_DL_LIBS} )
 
 # ------------------ MIR RUN ----------------------
 
@@ -84,14 +84,6 @@ target_link_libraries(b2m mir)
 add_executable (b2ctab "mir-utils/b2ctab.c")
 target_include_directories(b2ctab PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(b2ctab mir)
-
-# ------------------ L2M --------------------------
-find_package(LLVM)
-if(LLVM_FOUND)
-  add_executable (l2m "llvm2mir/llvm2mir.c" "llvm2mir/llvm2mir-driver.c" "llvm2mir/llvm2mir.h")
-  target_include_directories(l2m PRIVATE ${PROJECT_SOURCE_DIR} ${LLVM_INCLUDE_DIRS})
-  target_link_libraries(l2m mir m ${CMAKE_DL_LIBS} LLVM)
-endif()
 
 # ------------------ ADT tests --------------------------
 add_executable (varr_test "adt-tests/mir-varr-test.c")
@@ -246,5 +238,5 @@ add_test(mir2c-test mir2c_test)
 
 # ------------------ c2m tests --------------------------
 
-add_test(c2mir-simple-test c2m -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
+add_test(c2mir-simple-test cmm -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
 

@@ -2065,6 +2065,17 @@ static void add_to_temp_string (c2m_ctx_t c2m_ctx, const char *str) {
   VARR_PUSH (char, temp_string, '\0');
 }
 
+static void add_to_temp_string_len (c2m_ctx_t c2m_ctx, const char *str, size_t len) {
+  size_t i;
+
+  if (len != 0 && VARR_LENGTH (char, temp_string) != 0
+      && VARR_GET (char, temp_string, VARR_LENGTH (char, temp_string) - 1) == '\0') {
+    VARR_POP (char, temp_string);
+  }
+  for (i = 0; i < len; i++) VARR_PUSH (char, temp_string, str[i]);
+  VARR_PUSH (char, temp_string, '\0');
+}
+
 static int macro_eq (macro_t macro1, macro_t macro2, void *arg MIR_UNUSED) {
   return macro1->id->repr == macro2->id->repr;
 }
@@ -2491,6 +2502,26 @@ static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char *
   *content = NULL;
   assert (t->code == T_STR || t->code == T_HEADER);
   if ((name = t->node->u.s.s)[0] != '/') {
+    if (name[0] == ':') {
+      const char *libpath, *start, *end, *libname = name + 1;
+
+      if ((libpath = getenv ("HMM_LIBPATH")) != NULL && *libpath != '\0') {
+        for (start = libpath;; start = end + 1) {
+          for (end = start; *end != '\0' && *end != ':'; end++);
+          if (end > start) {
+            size_t dlen = end - start;
+            VARR_TRUNC (char, temp_string, 0);
+            add_to_temp_string_len (c2m_ctx, start, dlen);
+            VARR_PUSH (char, temp_string, '/');
+            VARR_PUSH (char, temp_string, '\0');
+            fullname = get_full_name (c2m_ctx, VARR_ADDR (char, temp_string), libname, TRUE);
+            if (file_found_p (fullname)) return uniq_cstr (c2m_ctx, fullname).s;
+          }
+          if (*end == '\0') break;
+        }
+      }
+      return name;
+    }
     if (t->repr[0] == '"') {
       /* Search relative to the current source dir */
       if (cs->fname != NULL) {

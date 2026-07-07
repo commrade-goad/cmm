@@ -509,6 +509,7 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "default_mem_protect") == 0) return default_mem_protect;
 #endif
 #endif
+    if (strcmp (name, "eval_template") == 0) return eval_template;
     fprintf (stderr, "can not load symbol %s\n", name);
     close_std_libs ();
     exit (1);

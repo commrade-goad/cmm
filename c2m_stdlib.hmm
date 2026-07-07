@@ -1,0 +1,1 @@
+extern const char *eval_template(const char *str);

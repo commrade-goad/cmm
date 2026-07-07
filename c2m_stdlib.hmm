@@ -1,1 +1,35 @@
 extern const char *eval_template(const char *str);
+
+#include <stddef.h>
+
+typedef enum {
+  __TYPE_VOID,
+  __TYPE_BOOL,
+  __TYPE_CHAR,
+  __TYPE_SCHAR,
+  __TYPE_UCHAR,
+  __TYPE_SHORT,
+  __TYPE_USHORT,
+  __TYPE_INT,
+  __TYPE_UINT,
+  __TYPE_LONG,
+  __TYPE_ULONG,
+  __TYPE_LLONG,
+  __TYPE_ULLONG,
+  __TYPE_FLOAT,
+  __TYPE_DOUBLE,
+  __TYPE_LDOUBLE,
+  __TYPE_PTR,
+  __TYPE_ENUM,
+  __TYPE_STRUCT,
+  __TYPE_UNION,
+  __TYPE_ARRAY,
+  __TYPE_FUNC,
+} __type_kind;
+
+typedef struct __type_t {
+  char         name[64];
+  size_t       size;
+  size_t       align;
+  __type_kind  kind;
+} __type_t;

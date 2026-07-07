@@ -313,6 +313,7 @@ struct type {
     struct arr_type *arr_type;
     struct func_type *func_type;
   } u;
+  MIR_item_t type_item; /* __type_t data descriptor, NULL if not yet generated */
 };
 
 /*!*/ static struct type VOID_TYPE
@@ -579,6 +580,7 @@ typedef enum {
   REP8 (T_EL, SIGNED, SIZEOF, STATIC, STRUCT, SWITCH, TYPEDEF, TYPEOF, UNION),
   REP5 (T_EL, UNSIGNED, VOID, VOLATILE, WHILE, EOFILE),
   T_DEFER, /* extension keyword: `defer <stmt>;` */
+  T___TYPE_OF, /* extension: __type_of(expr) -> const __type_t * */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -592,7 +594,7 @@ typedef enum {
   T_EOU, /* end of translation unit */
 } token_code_t;
 
-static token_code_t FIRST_KW = T_BOOL, LAST_KW = T_DEFER;
+static token_code_t FIRST_KW = T_BOOL, LAST_KW = T___TYPE_OF;
 
 #define NODE_EL(n) N_##n
 
@@ -615,6 +617,8 @@ typedef enum {
   REP8 (NODE_EL, STAR, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT),
   REP4 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR),
   N_DEFER, /* extension: N_DEFER(N_LIST:(label)*, stmt) -- see `defer` keyword */
+  N_TYPE_OF, /* __type_of(expr) → const __type_t * */
+  N_TYPEOF,  /* typeof(expr) used as type specifier */
 } node_code_t;
 
 #undef REP_SEP
@@ -4192,6 +4196,14 @@ D (primary_expr) {
       P (expr);
     }
     if (M (')')) return r;
+  } else if (MP (T___TYPE_OF, pos)) {
+    PT ('(');
+    r = TRY (type_name);
+    if (r == err_node) {
+      P (assign_expr);
+    }
+    PT (')');
+    return new_pos_node1 (c2m_ctx, N_TYPE_OF, pos, r);
   } else if (MP (T_GENERIC, pos)) {
     PT ('(');
     P (assign_expr);
@@ -4688,6 +4700,14 @@ DA (type_spec) {
       op2 = new_node (c2m_ctx, N_IGNORE);
     }
     r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
+  } else if (MP (T_TYPEOF, pos)) {
+    PT ('(');
+    r = TRY (type_name);
+    if (r == err_node) {
+      P (assign_expr);
+    }
+    PT (')');
+    r = new_pos_node1 (c2m_ctx, N_TYPEOF, pos, r);
   } else if (arg == NULL) {
     P (typedef_name);
   } else {
@@ -5504,6 +5524,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   kw_add (c2m_ctx, "continue", T_CONTINUE, 0);
   kw_add (c2m_ctx, "default", T_DEFAULT, 0);
   kw_add (c2m_ctx, "defer", T_DEFER, FLAG_EXT);
+  kw_add (c2m_ctx, "__type_of", T___TYPE_OF, FLAG_EXT);
   kw_add (c2m_ctx, "do", T_DO, 0);
   kw_add (c2m_ctx, "double", T_DOUBLE, 0);
   kw_add (c2m_ctx, "else", T_ELSE, 0);
@@ -5753,6 +5774,7 @@ static void init_type (struct type *type) {
   type->raw_size = MIR_SIZE_MAX;
   type->func_type_before_adjustment_p = FALSE;
   type->unnamed_anon_struct_union_member_type_p = FALSE;
+  type->type_item = NULL;
 }
 
 static void set_type_pos_node (struct type *type, node_t n) {
@@ -8372,7 +8394,7 @@ static void classify_node (node_t n, int *expr_attr_p, int *stmt_p) {
     REP8 (NODE_CASE, RSH, RSH_ASSIGN, ADD, ADD_ASSIGN, SUB, SUB_ASSIGN, MUL, MUL_ASSIGN)
     REP8 (NODE_CASE, DIV, DIV_ASSIGN, MOD, MOD_ASSIGN, IND, FIELD, ADDR, DEREF)
     REP8 (NODE_CASE, DEREF_FIELD, COND, INC, DEC, POST_INC, POST_DEC, ALIGNOF, SIZEOF)
-    REP6 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC)
+    REP7 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC, TYPE_OF)
     *expr_attr_p = TRUE;
     break;
     REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
@@ -8384,7 +8406,7 @@ static void classify_node (node_t n, int *expr_attr_p, int *stmt_p) {
     REP8 (NODE_CASE, INT, LONG, FLOAT, DOUBLE, SIGNED, UNSIGNED, BOOL, STRUCT)
     REP8 (NODE_CASE, UNION, ENUM, ENUM_CONST, MEMBER, CONST, RESTRICT, VOLATILE, ATOMIC)
     REP8 (NODE_CASE, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR, POINTER, DOTS, ARR)
-    REP6 (NODE_CASE, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF, MODULE)
+    REP7 (NODE_CASE, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF, MODULE, TYPEOF)
     break;
   default: assert (FALSE);
   }
@@ -9249,6 +9271,41 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     e->u.lvalue_node = r;
     *e->type = *t1;
     if (curr_scope != top_scope) VARR_PUSH (decl_t, func_decls_for_allocation, decl);
+    break;
+  }
+  case N_TYPE_OF: {
+    struct type *target_type;
+    op1 = NL_HEAD (r->u.ops);
+    check (c2m_ctx, op1, r);
+    if (op1->code == N_TYPE) {
+      target_type = ((struct decl_spec *) op1->attr)->type;
+    } else {
+      target_type = ((struct expr *) op1->attr)->type;
+    }
+    e = create_expr (c2m_ctx, r);
+    e->type->mode = TM_PTR;
+    e->type->pos_node = r;
+    e->type->u.ptr_type = &VOID_TYPE;
+    /* store target type in def_node for gen phase */
+    e->def_node = (node_t) target_type;
+    break;
+  }
+  case N_TYPEOF: {
+    /* typeof(expr_or_type) used as type specifier */
+    op1 = NL_HEAD (r->u.ops);
+    check (c2m_ctx, op1, r);
+    /* resolve to the type of the operand */
+    assert (context != NULL);
+    r->attr = reg_malloc (c2m_ctx, sizeof (struct decl_spec));
+    if (op1->code == N_TYPE) {
+      *(struct decl_spec *) r->attr = ((struct decl *) op1->attr)->decl_spec;
+    } else {
+      /* expression form: make a type from the expression's type */
+      struct type *expr_type = ((struct expr *) op1->attr)->type;
+      struct decl_spec *ds = r->attr;
+      memset (ds, 0, sizeof (*ds));
+      ds->type = expr_type;
+    }
     break;
   }
   case N_CALL: {
@@ -12232,6 +12289,102 @@ static int unsigned_case_compare (const void *v1, const void *v2) {
   return e1->c.u_val < e2->c.u_val ? -1 : 1;
 }
 
+static const char *get_type_name_for_desc (const struct type *type) {
+  switch (type->mode) {
+  case TM_BASIC:
+    switch (type->u.basic_type) {
+    case TP_VOID: return "void";
+    case TP_BOOL: return "_Bool";
+    case TP_CHAR: return "char";
+    case TP_SCHAR: return "signed char";
+    case TP_UCHAR: return "unsigned char";
+    case TP_SHORT: return "short";
+    case TP_USHORT: return "unsigned short";
+    case TP_INT: return "int";
+    case TP_UINT: return "unsigned int";
+    case TP_LONG: return "long";
+    case TP_ULONG: return "unsigned long";
+    case TP_LLONG: return "long long";
+    case TP_ULLONG: return "unsigned long long";
+    case TP_FLOAT: return "float";
+    case TP_DOUBLE: return "double";
+    case TP_LDOUBLE: return "long double";
+    default: return "?";
+    }
+  case TM_ENUM: {
+    node_t tag = type->u.tag_type;
+    if (tag != NULL && NL_HEAD (tag->u.ops)->code != N_IGNORE)
+      return NL_HEAD (tag->u.ops)->u.s.s;
+    return "enum ?";
+  }
+  case TM_STRUCT:
+  case TM_UNION: {
+    node_t tag = type->u.tag_type;
+    if (tag != NULL && NL_HEAD (tag->u.ops)->code != N_IGNORE)
+      return NL_HEAD (tag->u.ops)->u.s.s;
+    return type->mode == TM_STRUCT ? "struct ?" : "union ?";
+  }
+  case TM_PTR: return "*";
+  case TM_ARR: return "[]";
+  case TM_FUNC: return "()";
+  default: return "?";
+  }
+}
+
+static int get_type_kind_for_desc (const struct type *type) {
+  /* __type_kind values (must match enum in c2m_stdlib.hmm):
+     __TYPE_VOID=0, __TYPE_BOOL=1, __TYPE_CHAR=2, ..., __TYPE_FUNC=22 */
+  if (type->mode == TM_BASIC) return (int) type->u.basic_type - 1;
+  /* map: TP_VOID=1 → __TYPE_VOID=0, TP_BOOL=2 → __TYPE_BOOL=1, etc. */
+  switch (type->mode) {
+  case TM_ENUM:  return 17; /* __TYPE_ENUM */
+  case TM_STRUCT: return 18; /* __TYPE_STRUCT */
+  case TM_UNION:  return 19; /* __TYPE_UNION */
+  case TM_PTR:    return 16; /* __TYPE_PTR */
+  case TM_ARR:    return 20; /* __TYPE_ARRAY */
+  case TM_FUNC:   return 21; /* __TYPE_FUNC */
+  default:        return 0;  /* fallback */
+  }
+}
+
+static MIR_item_t gen_ensure_type_descriptor (c2m_ctx_t c2m_ctx, struct type *type) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  char desc_name[256];
+  uint8_t buf[88]; /* __type_t layout: name[64] + size + align + kind + padding */
+  const char *tname;
+  mir_size_t tsize;
+  int talign;
+  int tkind;
+
+  if (type->type_item != NULL) return type->type_item;
+
+  set_type_layout (c2m_ctx, type);
+  tname = get_type_name_for_desc (type);
+  tsize = type_size (c2m_ctx, type);
+  talign = type_align (type);
+  tkind = get_type_kind_for_desc (type);
+
+  memset (buf, 0, sizeof (buf));
+  /* offset 0: name[64] */
+  strncpy ((char *) buf, tname, 63);
+  /* offset 64: size_t size */
+  memcpy (buf + 64, &tsize, sizeof (mir_size_t));
+  /* offset 72: size_t align */
+  if (talign < 0) talign = 1;
+  {
+    mir_size_t a = (mir_size_t) talign;
+    memcpy (buf + 72, &a, sizeof (mir_size_t));
+  }
+  /* offset 80: int kind */
+  memcpy (buf + 80, &tkind, sizeof (int));
+
+  snprintf (desc_name, sizeof (desc_name), "__type_%s_%p", tname, (void *) type);
+
+  type->type_item = MIR_new_data (ctx, desc_name, MIR_T_U8, sizeof (buf), buf);
+  return type->type_item;
+}
+
+
 static void make_cond_val (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label,
                            MIR_label_t false_label, op_t *res) {
   MIR_context_t ctx = c2m_ctx->ctx;
@@ -12597,6 +12750,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res.mir_op.u.mem.base = temp_op.mir_op.u.reg;
     }
     res.mir_op.u.mem.type = t;
+    break;
+  }
+  case N_TYPE_OF: {
+    MIR_item_t type_item;
+    e = r->attr;
+    type = (struct type *) e->def_node;
+    type_item = gen_ensure_type_descriptor (c2m_ctx, type);
+    t = MIR_T_I64;
+    res = get_new_temp (c2m_ctx, t);
+    emit2 (c2m_ctx, MIR_MOV, res.mir_op, MIR_new_ref_op (ctx, type_item));
     break;
   }
   case N_LABEL_ADDR: {

@@ -1,0 +1,191 @@
+* Runtime Type Info System
+
+** Goal
+
+Allow any C type (primitives, enums, structs, unions, pointers) to be
+introspected at runtime via a ~const __type_t *~ descriptor that the compiler
+auto-generates for every type in the translation unit.
+
+** Usage (user's view)
+
+#+BEGIN_SRC c
+// --- Opaque container (in stdlib) ---
+typedef struct {
+    void *data;
+    const __type_t *type;
+} Opaque;
+
+// --- Runtime assertion ---
+#define assert_type(o, T) assert((o).type == __type_of(T))
+
+// --- User code ---
+enum Color { RED, GREEN, BLUE };
+
+typedef struct {
+    char *name;
+    int age;
+} Person;
+
+int main() {
+    Person p = {"Alice", 30};
+
+    // wrap without losing type info
+    Opaque op = { &p, __type_of(p) };    // or __type_of(Person)
+
+    // runtime check
+    assert_type(op, Person);
+
+    // introspection
+    const __type_t *t = op.type;
+    printf("type: %s\n", t->name);       // "Person"
+    printf("size: %zu\n", t->size);       // sizeof(Person)
+    printf("kind: %d\n", t->kind);        // __TYPE_STRUCT
+
+    // enum -> string at runtime
+    const __type_t *ct = __type_of(Color);
+    printf("%s\n", ct->enum_str(GREEN));   // "GREEN"
+    int v = ct->enum_val("BLUE");          // 2
+
+    // struct field iteration
+    for (int i = 0; i < t->s.field_count; i++) {
+        printf("  %s (offset %zu, type %s)\n",
+               t->s.field_names[i],
+               t->s.field_offsets[i],
+               t->s.field_types[i]->name);
+    }
+    // prints:
+    //   name (offset 0, type char*)
+    //   age  (offset 8, type int)
+
+    return 0;
+}
+#+END_SRC
+
+Generic containers:
+
+#+BEGIN_SRC c
+typedef struct {
+    Opaque *items;
+    int count, capacity;
+    const __type_t *element_type;
+} ArrayList;
+
+void al_push(ArrayList *al, Opaque val) {
+    assert(val.type == al->element_type);  // type mismatch = crash
+    // memcpy val.data into slot by val.type->size
+}
+#+END_SRC
+
+** ~__type_t~ struct definition (in stdlib header)
+
+#+BEGIN_SRC c
+typedef enum {
+    __TYPE_VOID,
+    __TYPE_BOOL,
+    __TYPE_CHAR,
+    __TYPE_SCHAR,
+    __TYPE_UCHAR,
+    __TYPE_SHORT,
+    __TYPE_USHORT,
+    __TYPE_INT,
+    __TYPE_UINT,
+    __TYPE_LONG,
+    __TYPE_ULONG,
+    __TYPE_LLONG,
+    __TYPE_ULLONG,
+    __TYPE_FLOAT,
+    __TYPE_DOUBLE,
+    __TYPE_LDOUBLE,
+    __TYPE_PTR,
+    __TYPE_ENUM,
+    __TYPE_STRUCT,
+    __TYPE_UNION,
+    __TYPE_ARRAY,
+    __TYPE_FUNC,
+} __type_kind;
+
+typedef struct __type_t {
+    const char    *name;       // "int", "enum Color", "Person"
+    size_t         size;       // sizeof(type)
+    size_t         align;      // _Alignof(type)
+    __type_kind    kind;
+
+    // enum info (valid when kind == __TYPE_ENUM)
+    const char   *(*enum_str)(int value);   // value->"NAME"
+    int           (*enum_val)(const char *name); // "NAME"->value
+
+    // struct/union info (valid when kind == __TYPE_STRUCT/_UNION)
+    struct {
+        const char        **field_names;
+        size_t             *field_offsets;
+        size_t              field_sizes;    // for bitfields
+        const struct __type_t **field_types;
+        int                 field_count;
+    } s;
+} __type_t;
+#+END_SRC
+
+** What the compiler generates (user never writes this)
+
+For every type in the translation unit, c2mir emits a ~static const __type_t~
+global. Example:
+
+#+BEGIN_SRC c
+// For enum Color { RED, GREEN, BLUE }
+static const __type_t __type_Color = {
+    .name = "Color",
+    .size = 4,
+    .align = 4,
+    .kind = __TYPE_ENUM,
+    .enum_str = __enum_Color_to_str,
+    .enum_val = __enum_Color_from_str,
+};
+
+// For Person
+static const __type_t __type_Person = {
+    .name = "Person",
+    .size = 16,
+    .align = 8,
+    .kind = __TYPE_STRUCT,
+    .s = {
+        .field_names  = (const char *[]){"name", "age"},
+        .field_offsets = (size_t[]){0, 8},
+        .field_types  = (const __type_t *[]){__type_char_ptr, __type_int},
+        .field_count  = 2,
+    },
+};
+#+END_SRC
+
+Built-in types (~__type_int~, ~__type_char~, etc.) are always available in
+every compilation, like ~__builtin_va_list~.
+
+** ~__type_of(x)~ built-in
+
+A compiler primitive expression. ~__type_of(x)~ where ~x~ is a type name or
+expression yields ~const __type_t *~ pointing to the static descriptor.
+
+- ~__type_of(int)~ -> ~&__type_int~
+- ~__type_of(enum Color)~ -> ~&__type_Color~
+- ~__type_of(Person)~ -> ~&__type_Person~
+- ~__type_of(my_var)~ -> ~&__type_<typeof(my_var)>~
+
+Zero runtime overhead -- resolves at compile time.
+
+** Implementation plan
+
+1. Define ~__type_kind~ and ~__type_t~ in ~c2m_stdlib.hmm~
+2. In c2mir's type system pass, after all types are resolved, iterate all
+   types and emit ~static const __type_t~ globals with string tables for
+   enum names and struct fields
+3. Add ~__type_of~ as a new primary expression in the parser
+4. For enum types, generate ~__enum_X_to_str()~ and ~__enum_X_from_str()~
+   helper functions (or table lookups)
+5. Wire up the built-in type descriptors (~__type_int~, etc.)
+6. Register the generated globals so MIR can find them at link time
+
+** Questions to resolve
+
+- Naming: ~__type_of~ vs ~__typeinfo~ vs ~typeof_info~?
+- Should ~__type_t~ globals be ~static~ (per-TU) or weak symbols?
+- Anonymous structs/enums -- synthesize a name or skip?
+- ~enum_str~ as function pointer vs direct string table pointer?

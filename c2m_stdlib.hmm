@@ -101,3 +101,120 @@ static Opaque *da_get (DynamicArray *da, int i) {
   assert (i >= 0 && i < da->count);
   return &da->items[i];
 }
+
+/* --- Open-addressing HashMap with inline key/value storage --- */
+
+static uint64_t hm_hash (const void *data, size_t len) {
+  const unsigned char *p = data;
+  uint64_t h = 14695981039346656037ULL;
+  for (size_t i = 0; i < len; i++)
+    h = (h ^ p[i]) * 1099511628211ULL;
+  return h;
+}
+
+typedef struct {
+  uint8_t    *slots;       /* 0=empty 1=occupied 2=tombstone */
+  uint8_t    *keys;
+  uint8_t    *values;
+  int         count;
+  int         capacity;
+  const __type_t *key_type;
+  const __type_t *value_type;
+} HashMap;
+
+static void hm_resize (HashMap *hm);
+
+static HashMap hm_create (const __type_t *kt, const __type_t *vt) {
+  HashMap hm = {0};
+  hm.key_type = kt;
+  hm.value_type = vt;
+  hm.capacity = 8;
+  hm.slots = calloc ((size_t) hm.capacity, 1);
+  hm.keys = malloc ((size_t) hm.capacity * kt->size);
+  hm.values = malloc ((size_t) hm.capacity * vt->size);
+  return hm;
+}
+
+static void hm_destroy (HashMap *hm) {
+  free (hm->slots);  hm->slots = NULL;
+  free (hm->keys);   hm->keys = NULL;
+  free (hm->values); hm->values = NULL;
+  hm->count = hm->capacity = 0;
+}
+
+static void hm_set (HashMap *hm, Opaque key, Opaque value) {
+  assert (key.type->kind == hm->key_type->kind && key.type->size == hm->key_type->size
+          && strcmp (key.type->name, hm->key_type->name) == 0);
+  assert (value.type->kind == hm->value_type->kind && value.type->size == hm->value_type->size
+          && strcmp (value.type->name, hm->value_type->name) == 0);
+  if ((hm->count + 1) * 4 >= hm->capacity * 3) hm_resize (hm);
+  size_t ksize = hm->key_type->size, vsize = hm->value_type->size;
+  uint64_t hash = hm_hash (key.data, ksize);
+  int mask = hm->capacity - 1;
+  for (int i = 0;; i++) {
+    int idx = (int) (hash + i) & mask;
+    if (hm->slots[idx] == 0 || hm->slots[idx] == 2) {
+      hm->slots[idx] = 1;
+      memcpy (&hm->keys[idx * ksize],  key.data,  ksize);
+      memcpy (&hm->values[idx * vsize], value.data, vsize);
+      hm->count++;
+      return;
+    }
+    if (hm->slots[idx] == 1 && memcmp (&hm->keys[idx * ksize], key.data, ksize) == 0) {
+      memcpy (&hm->values[idx * vsize], value.data, vsize);
+      return;
+    }
+  }
+}
+
+static void *hm_get (HashMap *hm, Opaque key) {
+  size_t ksize = hm->key_type->size;
+  uint64_t hash = hm_hash (key.data, ksize);
+  int mask = hm->capacity - 1;
+  for (int i = 0; i < hm->capacity; i++) {
+    int idx = (int) (hash + i) & mask;
+    if (hm->slots[idx] == 0) return NULL;
+    if (hm->slots[idx] == 1 && memcmp (&hm->keys[idx * ksize], key.data, ksize) == 0)
+      return &hm->values[idx * hm->value_type->size];
+  }
+  return NULL;
+}
+
+static int hm_has (HashMap *hm, Opaque key) {
+  return hm_get (hm, key) != NULL;
+}
+
+static void hm_remove (HashMap *hm, Opaque key) {
+  size_t ksize = hm->key_type->size;
+  uint64_t hash = hm_hash (key.data, ksize);
+  int mask = hm->capacity - 1;
+  for (int i = 0; i < hm->capacity; i++) {
+    int idx = (int) (hash + i) & mask;
+    if (hm->slots[idx] == 0) return;
+    if (hm->slots[idx] == 1 && memcmp (&hm->keys[idx * ksize], key.data, ksize) == 0) {
+      hm->slots[idx] = 2;
+      hm->count--;
+      return;
+    }
+  }
+}
+
+static void hm_resize (HashMap *hm) {
+  int old_cap = hm->capacity;
+  uint8_t *old_slots = hm->slots;
+  uint8_t *old_keys = hm->keys;
+  uint8_t *old_values = hm->values;
+  size_t ksize = hm->key_type->size, vsize = hm->value_type->size;
+
+  hm->capacity = old_cap * 2;
+  hm->slots = calloc ((size_t) hm->capacity, 1);
+  hm->keys  = malloc ((size_t) hm->capacity * ksize);
+  hm->values = malloc ((size_t) hm->capacity * vsize);
+  hm->count = 0;
+
+  for (int i = 0; i < old_cap; i++)
+    if (old_slots[i] == 1)
+      hm_set (hm, (Opaque){ &old_keys[i * ksize], hm->key_type },
+                  (Opaque){ &old_values[i * vsize], hm->value_type });
+  free (old_slots); free (old_keys); free (old_values);
+}

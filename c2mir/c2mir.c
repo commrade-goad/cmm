@@ -7008,6 +7008,12 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       }
       break;
     }
+    case N_TYPEOF: {
+      check (c2m_ctx, n, decl_node);
+      struct decl_spec *ds = n->attr;
+      if (ds != NULL) *type = *ds->type;
+      break;
+    }
     default: abort ();
     }
   if (type->mode == TM_BASIC && type->u.basic_type == TP_UNDEF) {
@@ -9298,7 +9304,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     assert (context != NULL);
     r->attr = reg_malloc (c2m_ctx, sizeof (struct decl_spec));
     if (op1->code == N_TYPE) {
-      *(struct decl_spec *) r->attr = ((struct decl *) op1->attr)->decl_spec;
+      *(struct decl_spec *) r->attr = *((struct decl_spec *) op1->attr);
     } else {
       /* expression form: make a type from the expression's type */
       struct type *expr_type = ((struct expr *) op1->attr)->type;
@@ -12349,12 +12355,13 @@ static int get_type_kind_for_desc (const struct type *type) {
 
 static MIR_item_t gen_ensure_type_descriptor (c2m_ctx_t c2m_ctx, struct type *type) {
   MIR_context_t ctx = c2m_ctx->ctx;
+  #define TD_SIZE 8800 /* sizeof(__type_t) */
   char desc_name[256];
-  uint8_t buf[88]; /* __type_t layout: name[64] + size + align + kind + padding */
+  uint8_t buf[TD_SIZE];
   const char *tname;
   mir_size_t tsize;
-  int talign;
-  int tkind;
+  int talign, tkind;
+  int field_count = 0, member_count = 0;
 
   if (type->type_item != NULL) return type->type_item;
 
@@ -12378,10 +12385,64 @@ static MIR_item_t gen_ensure_type_descriptor (c2m_ctx_t c2m_ctx, struct type *ty
   /* offset 80: int kind */
   memcpy (buf + 80, &tkind, sizeof (int));
 
+  /* collect struct/union fields or enum members */
+  if (type->mode == TM_STRUCT || type->mode == TM_UNION) {
+    if (type->u.tag_type != NULL) {
+      node_t member_list = NL_EL (type->u.tag_type->u.ops, 1);
+      if (member_list->code != N_IGNORE) {
+        int idx = 0;
+        for (node_t el = NL_HEAD (member_list->u.ops); el != NULL && idx < 64; el = NL_NEXT (el)) {
+          if (el->code != N_MEMBER) continue;
+          decl_t decl = el->attr;
+          node_t specs = NL_HEAD (el->u.ops);
+          node_t declarator = NL_NEXT (specs);
+          if (declarator->code != N_IGNORE) {
+            const char *fname = NL_HEAD (declarator->u.ops)->u.s.s;
+            strncpy ((char *) (buf + 92 + idx * 32), fname, 31);
+          }
+          {
+            const char *ftype = get_type_name_for_desc (decl->decl_spec.type);
+            strncpy ((char *) (buf + 2140 + idx * 64), ftype, 63);
+          }
+          {
+            int32_t off = (int32_t) decl->offset;
+            memcpy (buf + 6236 + idx * sizeof (int32_t), &off, sizeof (int32_t));
+          }
+          idx++;
+        }
+        field_count = idx;
+      }
+    }
+  } else if (type->mode == TM_ENUM) {
+    if (type->u.tag_type != NULL) {
+      node_t enum_list = NL_NEXT (NL_HEAD (type->u.tag_type->u.ops));
+      if (enum_list->code != N_IGNORE) {
+        int idx = 0;
+        for (node_t en = NL_HEAD (enum_list->u.ops); en != NULL && idx < 64; en = NL_NEXT (en)) {
+          assert (en->code == N_ENUM_CONST);
+          node_t id = NL_HEAD (en->u.ops);
+          struct enum_value *ev = (struct enum_value *) en->attr;
+          strncpy ((char *) (buf + 6492 + idx * 32), id->u.s.s, 31);
+          {
+            int32_t v = (int32_t) ev->u.i_val;
+            memcpy (buf + 8540 + idx * sizeof (int32_t), &v, sizeof (int32_t));
+          }
+          idx++;
+        }
+        member_count = idx;
+      }
+    }
+  }
+
+  /* write field_count and member_count */
+  memcpy (buf + 84, &field_count, sizeof (int));
+  memcpy (buf + 88, &member_count, sizeof (int));
+
   snprintf (desc_name, sizeof (desc_name), "__type_%s_%p", tname, (void *) type);
 
   type->type_item = MIR_new_data (ctx, desc_name, MIR_T_U8, sizeof (buf), buf);
   return type->type_item;
+  #undef TD_SIZE
 }
 
 
@@ -12430,6 +12491,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       gen (c2m_ctx, n, true_label, false_label, val_p, NULL, expect_res);
     break;
   case N_IGNORE: break; /* do nothing */
+  case N_TYPEOF:
+  case N_TYPE: break; /* type spec remnants — handled in check */
   case N_I:
   case N_L: ll = r->u.l; goto int_val;
   case N_LL:

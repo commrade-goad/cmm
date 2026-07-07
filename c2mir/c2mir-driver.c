@@ -804,7 +804,7 @@ static void emit_literal_text (dyn_buf_t *body, const char *text, size_t len) {
     default: db_append_n (body, (const char *) &c, 1); break;
     }
   }
-  db_append (body, "\", FD);\n");
+  db_append (body, "\");\n");
 }
 
 /* Compute the 1-based source line number of `offset` within `code`. Used to
@@ -951,9 +951,12 @@ static uint8_t *expand_templates (const uint8_t *code, size_t code_len, size_t *
 
   db_append (&out, "#include <stdio.h>\n#include <string.h>\n\n");
   db_append (&out, "#ifndef render\n#define render(...) fprintf(FD, __VA_ARGS__)\n#endif\n\n");
+  db_append (&out, "static FILE *__tmpl_FD;\n");
+  db_append (&out, "#ifndef FD\n#define FD __tmpl_FD\n#endif\n\n");
   db_append_n (&out, prelude.data, prelude.len);
-  db_append (&out, "\nstatic void __tmpl_emit (const char *s, FILE *FD) { fputs (s, FD); }\n\n");
-  db_append (&out, "static void __tmpl_main (FILE *FD) {\n");
+  db_append (&out, "\nstatic void __tmpl_emit (const char *s) { fputs (s, __tmpl_FD); }\n\n");
+  db_append (&out, "static void __tmpl_main (FILE *__tmpl_FD_arg) {\n");
+  db_append (&out, "  __tmpl_FD = __tmpl_FD_arg;\n");
   db_append_n (&out, body.data, body.len);
   db_append (&out, "}\n\n");
   db_append (&out,

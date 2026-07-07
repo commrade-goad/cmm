@@ -1,0 +1,360 @@
+* C Macro System Upgrade for c2mir
+
+** Goal
+
+Fix the pain points of C's ~#define~ without throwing away backward
+compatibility. Every existing C file should still compile.  New features are
+opt-in additions.
+
+** 1. Hygiene (__fresh__)
+
+*** Problem
+
+Temp variables in macros capture:
+
+#+BEGIN_SRC c
+#define swap(t, a, b) { t tmp_ = a; a = b; b = tmp_; }
+
+int tmp_ = 0;            // oops — name clash
+swap(int, x, y);         // expands to { int tmp_ = x; y = tmp_; }
+                         // shadows/overwrites the outer tmp_
+#+END_SRC
+
+*** Solution: ~__fresh__~ keyword
+
+A compile-time gen-sym.  Each expansion gets a unique anonymous identifier.
+
+#+BEGIN_SRC c
+#define swap(t, a, b) { t __fresh__ = a; a = b; b = __fresh__; }
+// expands to:   { int __fresh_0001 = x; x = y; y = __fresh_0001; }
+// next call:    { int __fresh_0002 = a; a = b; b = __fresh_0002; }
+#+END_SRC
+
+~__fresh__~ is a *primary expression* that lowers to an auto-incrementing
+counter scoped to the translation unit.  It can only appear inside macro
+bodies (diagnostic if used at file scope or in ordinary code).
+
+If you need the name for debugging, add an optional prefix:
+
+#+BEGIN_SRC c
+#define swap(t, a, b) { t __fresh__(tmp) = a; ... }
+// __fresh_0001_tmp
+#+END_SRC
+
+*** Parser changes
+
+Add ~T___FRESH__~ token.  In ~primary_expr()~, when ~T___FRESH__~ is seen,
+if followed by ~(~, parse string literal as prefix; emit ~N_FRESH~ node.
+Checker replaces ~N_FRESH~ with a fresh ~T_ID~ using an atomic counter.
+
+** 2. Scoped #define
+
+*** Problem
+
+~#define~ is file-scoped.  There is no way to have "private" macros that
+auto-cleanup without ~#undef~.  Macros from included headers leak into the
+TU and can clash.
+
+*** Solution
+
+A ~#define~ appearing inside a ~{ }~ block auto-undefs at ~}~.
+
+#+BEGIN_SRC c
+void f(void) {
+  #define LOCAL 42
+  int x = LOCAL;          // OK
+}
+int y = LOCAL;            // error: LOCAL is not defined
+#+END_SRC
+
+Also works for nested blocks and compound statements inside macros:
+
+#+BEGIN_SRC c
+if (cond) {
+  #define HELP 1
+  ...
+} else {
+  // HELP is already gone — both branches see the same thing
+}
+#+END_SRC
+
+*** Implementation
+
+In the preprocessor pass: push a macro-definition scope on ~{ ~ (including
+compound literals, init blocks, etc.)  Pop and ~#undef~ everything in that
+scope on ~}~.  A ~#define~ at file scope still lives for the whole TU.
+
+Transition rule: no existing code breaks because existing code never
+~#define~s inside ~{ }~ (nobody does that today given it's useless).
+
+** 3. Debugability (error chain)
+
+*** Problem
+
+When an error occurs inside a macro expansion, c2mir reports the expansion
+site, but not the macro definition site.  The user has no idea which macro
+produced the bad code.
+
+#+BEGIN_SRC c
+#define FOO(x) x + 1
+
+int *p = FOO("hello");   // error: int * = char * + int
+                         // but doesn't say "from macro FOO at line 1"
+#+END_SRC
+
+*** Solution: chained source locations
+
+Each AST node carries a ~src_loc~ chain (singly-linked list):
+
+#+BEGIN_SRC c
+typedef struct src_chain {
+  struct src_chain *next;
+  const char       *fname;
+  int               lno;
+  const char       *macro_name;   // NULL if not from macro
+} src_chain_t;
+#+END_SRC
+
+When a macro expands, the expansion site is pushed onto the chain.  Error
+reporting walks the chain:
+
+#+BEGIN_SRC c
+error at foo.c:10 (from macro "FOO" defined at foo.c:1):
+  incompatible types: int * = char * + int
+#+END_SRC
+
+For nested macros, the full expansion stack is printed.
+
+** 4. Macro namespaces (#defnamespace / #undefnamespace)
+
+*** Problem
+
+Macros from different libraries clash (~min~, ~max~, ~ARRAY_SIZE~,
+~container_of~).  Users prefix manually (~MATH_min~, ~GLIB_ARRAY_SIZE~)
+but this is convention, not enforced.
+
+There is also no way to hide internal macros from includers — everything
+leaks.  Ugly ~_INTERNAL~ / ~__detail__~ prefixes are the only defense.
+
+*** Solution: ~#defnamespace~ / ~#undefnamespace~
+
+A block-scoping directive that fits the existing preprocessor style
+(~#ifdef~ / ~#endif~, ~#if~ / ~#endif~).  No braces — just open / close.
+
+#+BEGIN_SRC c
+#defnamespace mylib
+  #define min(a,b) ((a)<(b)?(a):(b))
+  #define max(a,b) ((a)>(b)?(a):(b))
+#undefnamespace          // explicit close
+// or auto-closes at EOF
+#+END_SRC
+
+*** Visibility modes
+
+| Mode | Name | Effect on ~#include~ |
+|------+------+----------------------|
+| `private` | The name ~private~ | Preprocessor skips the entire region — text is never seen by includers. Macros, types, declarations all vanish. |
+| `public` | The name ~public~ | Default traditional behavior — everything visible. |
+| User-named | ~mylib~, ~math~, etc. | No visibility change, just grouping. Enables bulk ~#undefnamespace~. |
+
+*** Private by deletion (the killer feature)
+
+When the includer's preprocessor hits ~#defnamespace private~:
+
+1. Increment a skip counter
+2. Ignore every token (including nested ~#include~, ~#define~,
+   declarations, everything)
+3. Decrement on ~#undefnamespace~ or EOF
+4. The private region is literally invisible — no declarations, no macros,
+   nothing leaks
+
+This is "private by deletion" rather than "private by convention."  A
+library header can define internal macros and helpers freely without
+polluting the includer's namespace:
+
+#+BEGIN_SRC c
+// mylib.h
+#defnamespace public
+  #define MYLIB_API(x) mylib_ ## x
+#undefnamespace
+
+#defnamespace private
+  #define INTERNAL_BUF_SIZE 256
+  static void _helper(void) { ... }
+  // This entire block vanishes on #include
+#undefnamespace
+
+#defnamespace public
+  int MYLIB_API(compute)(void);
+#undefnamespace
+// The includer sees only:
+//   #define MYLIB_API(x) mylib_ ## x
+//   int mylib_compute(void);
+#+END_SRC
+
+*** Bulk undef
+
+#+BEGIN_SRC c
+#undefnamespace mylib          // undef every macro whose namespace starts with "mylib_"
+#undefnamespace *              // undef ALL namespaced macros
+#+END_SRC
+
+*** No linker effect
+
+~#defnamespace~ is purely a preprocessor directive.  Use ~static~ for
+linker hiding — orthogonal concerns.
+
+** 5. Out-of-order includes (multi-pass preprocessor)
+
+*** Problem
+
+c2mir is single-pass: a macro must be defined before it is used.  Includes
+must be at the top.  You cannot:
+
+#+BEGIN_SRC c
+int x = MAX(1, 2);               // ERROR: MAX not yet defined
+#include "defs.h"                 // defs.h #define MAX(a,b) ...
+#+END_SRC
+
+*** Solution: 4-pass / 2-pass preprocessor
+
+The idea is to decouple "collect declarations" from "resolve references."
+
+**** 2-pass mode (fast, most OOO cases)
+
+| Pass | Work |
+|------|------|
+| 1    | Scan the whole file (and all ~#include~s) for ~#define~, ~#include~, and ~#defnamespace~ directives.  Skip ~private~ namespace bodies.  Build macro-definition table and include graph. |
+| 2    | Compile normally.  All public macros are known before any code is parsed. |
+
+Limitation: macros defined inside function bodies (rare) still work because
+pass 1 collects them all.
+
+**** 4-pass mode (full OOO resolution)
+
+| Pass | Work |
+|------|------|
+| 1    | Tokenize the entire TU (all includes).  Collect ~#define~, ~#include~, and ~#error~ directives.  Build the full macro table (no expansion). |
+| 2    | Resolve ~#include~ graph (find cycles, error on missing files).  Expand ~#if~ / ~#ifdef~ / ~#elif~ with partial knowledge (known macros only).  Reorder includes topologically if needed. |
+| 3    | Expand all macros in all source text, using the complete macro table.  Emit the fully-expanded TU as a token stream. |
+| 4    | Compile the expanded token stream (business as usual). |
+
+This is essentially a standalone C preprocessor pass before the real
+compiler.  Many compilers (GCC, Clang) already work this way — c2mir should
+too.
+
+**** Incremental path
+
+1. Start with 2-pass: cheap to implement (just scan for ~#define~ before
+   parsing).  Handles 90% of OOO include cases.
+2. Add 4-pass later if needed (heavy lifting, big refactor).
+
+*** Implementation sketch for 2-pass
+
+#+BEGIN_SRC c
+// In c2mir-driver.c or a new c2mir-pp.c:
+
+typedef struct {
+  char *name;
+  char *replacement;
+  bool  is_function_like;
+  char **params;       // for function-like macros
+  int   n_params;
+} macro_def_t;
+
+typedef struct {
+  macro_def_t *macros;
+  int          nmacros;
+  int          nlines;           // for scanning
+} pp_state_t;
+
+// Pass 1: scan file without expansion
+pp_state_t *pp_scan(const char *source, const char *fname);
+
+// Pass 2: expand and compile
+void pp_expand_and_compile(pp_state_t *state, c2m_ctx_t ctx);
+#+END_SRC
+
+** 6. Type-generic macros (with __type_of)
+
+*** Problem
+
+~#define~ is purely textual.  You cannot overload a macro by type.
+
+#+BEGIN_SRC c
+// Want: one `serialize(x)` that handles int, float, string
+// Currently need _Generic or three separate macros:
+#define serialize_int(x)    ...
+#define serialize_float(x)  ...
+#define serialize_str(x)    ...
+#+END_SRC
+
+*** Solution (already partially works)
+
+_Generic already handles type dispatch:
+
+#+BEGIN_SRC c
+#define serialize(x) _Generic((x), \
+    int: serialize_int, \
+    float: serialize_float, \
+    char *: serialize_str \
+  )(x)
+#+END_SRC
+
+The missing piece is making this ergonomic.  Two ideas:
+
+**** #typecase — type-aware overload
+
+#+BEGIN_SRC c
+#typecase serialize(x) {
+  int:    (void) printf("int %d\n", x);
+  double: (void) printf("dbl %f\n", x);
+  default: (void) fprintf(stderr, "unknown type\n");
+}
+// Expands to a _Generic wrapper automatically
+#+END_SRC
+
+**** #implicit_map — auto-generated per-type helpers
+
+#+BEGIN_SRC c
+// For every type T that appears with $T in the body,
+// auto-generate T_impl versions:
+#implicit_map serialize($T x) {
+  printf("serializing %s\n", __type_str($T));
+  // $T is replaced by each concrete type
+}
+// Expands to: serialize_int, serialize_double, etc.
+#+END_SRC
+
+(Defer this if $T templates are the bigger priority — they already solve
+type-generic programming in a more principled way.)
+
+** Implementation order
+
+| Phase | Feature | Est. lines | Risk |
+|-------+---------+------------+------|
+| 1 | ~__fresh__~ keyword (hygiene) | ~50 | Low — new expression node + counter |
+| 2 | Scoped ~#define~ | ~80 | Low — push/pop scope in preprocessor |
+| 3 | Error chain (source location chaining) | ~100 | Medium — touches all error paths |
+| 4 | ~#defnamespace~ / ~#undefnamespace~ + private skip | ~100 | Low — directive parsing + skip counter |
+| 5 | 2-pass mode (out-of-order includes) | ~300 | Medium — new preprocessor pass |
+| 6 | ~#typecase~ (type-generic macros) | ~120 | Medium — _Generic codegen |
+| 7 | 4-pass mode (full OOO) | ~500 | High — major refactor |
+
+** Open questions
+
+1. ~__fresh__~ — should it be ~__fresh__~ (like a keyword) or ~__FRESH__~
+   (like a built-in macro)?  Keyword is cleaner.
+2. Scoped ~#define~ — what about ~#undef~ inside a scope?  Should it be
+   an error to ~#undef~ something defined in an outer scope?  (Yes.)
+3. Error chain — store chain in ~pos_t~ or in a separate field?  ~pos_t~
+   is embedded in every node, so adding a pointer bulks up memory.
+   Alternative: keep ~pos_t~ as-is and add a global ~expansion_stack~
+   that errors walk.
+4. ~#defnamespace~ — only `private` and `public` are special, or should
+   user-named namespaces get any enforcement too?  (No — named = pure
+   organization.)
+5. 2-pass vs 4-pass — start with 2-pass (scan ~#define~ only) or go
+   straight to a full separate preprocessor?
+6. Should ~__fresh__~ produce the same gen-sym across multiple ~-ei~ runs
+   (deterministic)?  Yes — seed the counter from the source hash.

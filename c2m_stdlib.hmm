@@ -218,3 +218,103 @@ static void hm_resize (HashMap *hm) {
                   (Opaque){ &old_values[i * vsize], hm->value_type });
   free (old_slots); free (old_keys); free (old_values);
 }
+
+/* --- String (resizable, null-terminated) --- */
+
+typedef struct {
+  char  *data;
+  int    count;     /* length of string (excluding null) */
+  int    capacity;  /* allocated bytes (≥ count+1) */
+} String;
+
+static String str_new (void) {
+  String s = {0};
+  s.capacity = 16;
+  s.data = malloc ((size_t) s.capacity);
+  s.data[0] = '\0';
+  return s;
+}
+
+static String str_from (const char *cstr) {
+  int len = (int) strlen (cstr);
+  String s = {0};
+  s.count = len;
+  s.capacity = len + 16;
+  s.data = malloc ((size_t) s.capacity);
+  memcpy (s.data, cstr, (size_t) len + 1);
+  return s;
+}
+
+static void str_destroy (String *s) {
+  free (s->data);
+  s->data = NULL;
+  s->count = s->capacity = 0;
+}
+
+static void str_ensure_cap (String *s, int need) {
+  if (need <= s->capacity) return;
+  int new_cap = s->capacity ? s->capacity : 16;
+  while (new_cap < need) new_cap *= 2;
+  s->data = realloc (s->data, (size_t) new_cap);
+  s->capacity = new_cap;
+}
+
+static void str_append (String *s, const char *suffix) {
+  int slen = (int) strlen (suffix);
+  if (slen == 0) return;
+  str_ensure_cap (s, s->count + slen + 1);
+  memcpy (s->data + s->count, suffix, (size_t) slen + 1);
+  s->count += slen;
+}
+
+static void str_append_char (String *s, char c) {
+  str_ensure_cap (s, s->count + 2);
+  s->data[s->count] = c;
+  s->data[s->count + 1] = '\0';
+  s->count++;
+}
+
+static void str_clear (String *s) {
+  if (s->data != NULL) s->data[0] = '\0';
+  s->count = 0;
+}
+
+static const char *str_cstr (const String *s) {
+  return s->data;
+}
+
+/* --- StringView (non-owning slice) --- */
+
+/*
+typedef struct {
+  const char *data;
+  int         count;
+} StringView;
+
+static StringView sv_from (const char *cstr) {
+  StringView sv = {cstr, (int) strlen (cstr)};
+  return sv;
+}
+
+static StringView sv_from_parts (const char *data, int len) {
+  StringView sv = {data, len};
+  return sv;
+}
+
+static int sv_eq (StringView a, StringView b) {
+  if (a.count != b.count) return 0;
+  return memcmp (a.data, b.data, (size_t) a.count) == 0;
+}
+
+static int sv_starts_with (StringView sv, const char *prefix) {
+  int plen = (int) strlen (prefix);
+  if (plen > sv.count) return 0;
+  return memcmp (sv.data, prefix, (size_t) plen) == 0;
+}
+
+static int sv_ends_with (StringView sv, const char *suffix) {
+  int slen = (int) strlen (suffix);
+  if (slen > sv.count) return 0;
+  return memcmp (sv.data + sv.count - slen, suffix, (size_t) slen) == 0;
+}
+*/

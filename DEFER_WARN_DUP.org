@@ -1,0 +1,27 @@
+* Defer Warning Duplication
+
+~defer~ deep-copies its body into every exit point during the AST
+transformation (~transform_defers~), which runs BEFORE type checking
+(~do_context~).  Each copy is independently checked, so warnings in a
+deferred body are emitted once per exit path.
+
+** Example
+
+#+BEGIN_SRC c
+void f(void) {
+  const char *s = ...;
+  defer { free((void *)s); };   // one copy per exit below
+  if (flag) return;             // copy #1 emitted here
+  return;                       // copy #2 emitted here
+                                // copy #3 falls through to block end
+}
+#+END_SRC
+
+~"discarding type qualifiers"~ appears 3 times.
+
+** Possible fixes
+
+- Deduplicate warnings by source position in the check phase.
+- Tell the use this is the exit path ~n~ warning typecheck. [ i like this one ]
+- Emit defer bodies only once and use a flag in generated code (bigger change to code-gen contract).
+- Accept it: annoying but harmless.

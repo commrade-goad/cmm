@@ -1305,6 +1305,22 @@ static void set_string_val (c2m_ctx_t c2m_ctx, token_t t, VARR (char) * temp, in
   }
 }
 
+static void set_raw_string_val (c2m_ctx_t c2m_ctx, token_t t, const char *raw_repr, VARR (char) * temp,
+                                size_t hash_num) {
+  size_t i, str_len = strlen (raw_repr), start, end;
+  const unsigned char *str = (const unsigned char *) raw_repr;
+
+  assert (t->code == T_STR && t->node != NULL && t->node->code == N_STR);
+  assert (str_len >= hash_num + 3);
+  start = hash_num + 2; /* r###" */
+  end = str_len - hash_num - 1; /* "### */
+  assert (start <= end);
+  VARR_TRUNC (char, temp, 0);
+  for (i = start; i < end; i++) push_str_char (temp, str[i], ' ');
+  push_str_char (temp, '\0', ' ');
+  t->node->u.s = uniq_str (c2m_ctx, VARR_ADDR (char, temp), VARR_LENGTH (char, temp));
+}
+
 static token_t new_id_token (c2m_ctx_t c2m_ctx, pos_t pos, const char *id_str) {
   token_t token;
   str_t str = uniq_cstr (c2m_ctx, id_str);
@@ -1727,6 +1743,73 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
     }
     default:
       if (isalpha (curr_c) || curr_c == '_') {
+        if (curr_c == 'r') {
+          size_t hash_num = 0;
+
+          pos = cs->pos;
+          curr_c = cs_get (c2m_ctx);
+          if (curr_c == '#') {
+            do {
+              hash_num++;
+              curr_c = cs_get (c2m_ctx);
+            } while (curr_c == '#');
+          }
+          if (curr_c == '"') {
+            token_t t;
+            size_t i, start, end;
+
+            VARR_TRUNC (char, symbol_text, 0);
+            VARR_PUSH (char, symbol_text, 'r');
+            for (size_t i = 0; i < hash_num; i++) VARR_PUSH (char, symbol_text, '#');
+            VARR_PUSH (char, symbol_text, '"');
+            for (;;) {
+              size_t i;
+
+              curr_c = cs_get (c2m_ctx);
+              if (curr_c == '\n' || curr_c == EOF) {
+                if (curr_c == '\n') cs_unget (c2m_ctx, '\n');
+                error (c2m_ctx, pos, "unterminated raw string literal");
+                VARR_PUSH (char, symbol_text, '"');
+                for (i = 0; i < hash_num; i++) VARR_PUSH (char, symbol_text, '#');
+                break;
+              }
+              if (curr_c == '\0') {
+                warning (c2m_ctx, pos, "null character in raw string literal ignored");
+              } else {
+                VARR_PUSH (char, symbol_text, curr_c);
+              }
+              if (curr_c != '"') continue;
+              for (i = 0; i < hash_num; i++) {
+                curr_c = cs_get (c2m_ctx);
+                if (curr_c != '#') {
+                  if (curr_c != EOF) cs_unget (c2m_ctx, curr_c);
+                  break;
+                }
+                VARR_PUSH (char, symbol_text, '#');
+              }
+              if (i == hash_num) break;
+            }
+            VARR_PUSH (char, symbol_text, '\0');
+            VARR_TRUNC (char, temp_string, 0);
+            VARR_PUSH (char, temp_string, '"');
+            start = hash_num + 2;
+            end = VARR_LENGTH (char, symbol_text) - hash_num - 2;
+            for (i = start; i < end; i++) {
+              curr_c = VARR_GET (char, symbol_text, i);
+              if (curr_c == '\\' || curr_c == '"') VARR_PUSH (char, temp_string, '\\');
+              VARR_PUSH (char, temp_string, curr_c);
+            }
+            VARR_PUSH (char, temp_string, '"');
+            VARR_PUSH (char, temp_string, '\0');
+            t = new_node_token (c2m_ctx, pos, VARR_ADDR (char, temp_string), T_STR,
+                                new_str_node (c2m_ctx, N_STR, empty_str, pos));
+            set_raw_string_val (c2m_ctx, t, VARR_ADDR (char, symbol_text), temp_string, hash_num);
+            return t;
+          }
+          if (curr_c != EOF) cs_unget (c2m_ctx, curr_c);
+          for (size_t i = 0; i < hash_num; i++) cs_unget (c2m_ctx, '#');
+          curr_c = 'r';
+        }
         if (curr_c == 'L' || curr_c == 'u' || curr_c == 'U') {
           wide_type = curr_c;
           if ((curr_c = cs_get (c2m_ctx)) == '\"' || curr_c == '\'') {

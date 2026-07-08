@@ -1,0 +1,5 @@
+C:\tmp\new\nline.txt
+say "hello\nworld"
+json: { "path": "C:\tmp\foo", "tag": "#raw" }
+pre:\n:post
+1 1 1

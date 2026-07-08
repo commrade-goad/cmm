@@ -4,6 +4,10 @@
     * support of the following C extensions (many of them can be used for better
       JIT implementation of dynamic programming languages):
       * `\e` escape sequence
+      * raw string literals using Rust/C++-style syntax:
+        * `r"..."` for simple raw strings
+        * `r#"..."#`, `r##"..."##`, ... for raw strings containing quotes
+        * raw strings do not process backslash escapes (`\n` stays two characters)
       * binary numbers starting with `0b` or `0B` prefix
       * macro `__has_include`
       * empty structure, unions, and initializer list

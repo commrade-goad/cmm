@@ -154,7 +154,7 @@ struct c2m_ctx {
   HTAB (tab_str_t) * str_tab;
   HTAB (tab_str_t) * str_key_tab;
   str_t empty_str;
-  unsigned curr_uid;
+  unsigned curr_uid, fresh_counter;
   int (*c_getc) (void *); /* c2mir interface get function */
   void *c_getc_data;
   unsigned n_errors, n_warnings;
@@ -189,6 +189,7 @@ typedef struct c2m_ctx *c2m_ctx_t;
 #define str_key_tab c2m_ctx->str_key_tab
 #define empty_str c2m_ctx->empty_str
 #define curr_uid c2m_ctx->curr_uid
+#define fresh_counter c2m_ctx->fresh_counter
 #define c_getc c2m_ctx->c_getc
 #define c_getc_data c2m_ctx->c_getc_data
 #define n_errors c2m_ctx->n_errors
@@ -581,6 +582,7 @@ typedef enum {
   REP5 (T_EL, UNSIGNED, VOID, VOLATILE, WHILE, EOFILE),
   T_DEFER, /* extension keyword: `defer <stmt>;` */
   T___TYPE_OF, /* extension: __type_of(expr) -> const __type_t * */
+  T___FRESH__, /* extension: __fresh__ - hygienic macro temp identifier */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -594,7 +596,7 @@ typedef enum {
   T_EOU, /* end of translation unit */
 } token_code_t;
 
-static token_code_t FIRST_KW = T_BOOL, LAST_KW = T___TYPE_OF;
+static token_code_t FIRST_KW = T_BOOL, LAST_KW = T___FRESH__;
 
 #define NODE_EL(n) N_##n
 
@@ -2006,6 +2008,7 @@ typedef struct macro_call {
   VARR (token_arr_t) * args;
   int repl_pos;                 /* position in macro replacement */
   VARR (token_t) * repl_buffer; /* LIST:(token nodes)* */
+  unsigned fresh_seq;           /* sequence number for __fresh__ in this expansion */
 } *macro_call_t;
 
 DEF_VARR (macro_call_t);
@@ -2154,6 +2157,7 @@ static macro_call_t new_macro_call (MIR_alloc_t alloc, macro_t m, pos_t pos) {
   mc->pos = pos;
   mc->repl_pos = 0;
   mc->args = NULL;
+  mc->fresh_seq = 0;
   VARR_CREATE (token_t, mc->repl_buffer, alloc, 64);
   return mc;
 }
@@ -2910,6 +2914,12 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
       sharp_pos = -1;
     }
     if (copy_p) t = copy_token (c2m_ctx, t, mc->pos);
+    if (t->code == T_ID && strcmp (t->repr, "__fresh__") == 0) {
+      char buf[64];
+      if (mc->fresh_seq == 0) mc->fresh_seq = ++fresh_counter;
+      snprintf (buf, sizeof (buf), "__fresh_%u", mc->fresh_seq);
+      t = new_id_token (c2m_ctx, t->pos, buf);
+    }
     add_token (mc->repl_buffer, t);
   }
 }
@@ -3870,7 +3880,9 @@ static void pre_out (c2m_ctx_t c2m_ctx, token_t t) {
   } else {
     assert (t->code != T_EOU && t->code != EOF);
     pre_last_token = t;
-    if ((t = pptoken2token (c2m_ctx, t, TRUE)) == NULL) return;
+    if ((t = pptoken2token (c2m_ctx, t, TRUE)) == NULL) {
+      return;
+    }
   }
   if (t->code == T_STR && VARR_LENGTH (token_t, recorded_tokens) != 0
       && VARR_LAST (token_t, recorded_tokens)->code == T_STR) { /* concat strings */
@@ -3925,6 +3937,11 @@ static void common_pre_out (c2m_ctx_t c2m_ctx, token_t t) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
 
   pptokens_num++;
+  if (t != NULL && (t->code == T___FRESH__
+                    || (t->code == T_ID && strcmp (t->repr, "__fresh__") == 0))) {
+    error (c2m_ctx, t->pos, "__fresh__ can only be used inside macro bodies");
+    return;
+  }
   (c2m_options->prepro_only_p ? pre_text_out : pre_out) (c2m_ctx, t);
 }
 
@@ -5503,6 +5520,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   error_func = fatal_error;
   record_level = 0;
   curr_uid = 0;
+  fresh_counter = 0;
   init_streams (c2m_ctx);
   VARR_CREATE (token_t, recorded_tokens, alloc, 32);
   VARR_CREATE (token_t, buffered_tokens, alloc, 32);
@@ -5525,6 +5543,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   kw_add (c2m_ctx, "default", T_DEFAULT, 0);
   kw_add (c2m_ctx, "defer", T_DEFER, FLAG_EXT);
   kw_add (c2m_ctx, "__type_of", T___TYPE_OF, FLAG_EXT);
+  kw_add (c2m_ctx, "__fresh__", T___FRESH__, FLAG_EXT);
   kw_add (c2m_ctx, "do", T_DO, 0);
   kw_add (c2m_ctx, "double", T_DOUBLE, 0);
   kw_add (c2m_ctx, "else", T_ELSE, 0);

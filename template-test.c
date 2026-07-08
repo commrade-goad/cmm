@@ -1,17 +1,17 @@
 \begin{document}
 
-@@ :prelude {
+#expand :prelude {
   #define NOB_IMPLEMENTATION
   #include "latex.h"
   #include "nob.h"
 }
 
-@@ :prelude {
+#expand :prelude {
   struct Foo {
     float bar;
   };
 }
-@@ :prelude {
+#expand :prelude {
   void figure(const char* path, const char* caption, const char* label, double width) {
       BLOCK("figure", "H") {
           ELM("centering");
@@ -35,13 +35,15 @@
 
 The layout logic stays cleanly separated from standard markup text blocks.
 
-@@ {
+#expand {
   struct Foo *foo = malloc(sizeof(struct Foo));
   foo.bar = 0.8;
   defer { if (foo) { free(foo); } }
   ELM("section", "Introduction");
   figure("assets/net.png", "Topologi Jaringan", "fig:net", foo.bar);
   Nob_Cmd cmd = {0};
-  nob_cmd_append(&cmd, "echo", "hello");
+  nob_cmd_append(&cmd, "echo", r#"hello "world""#);
   nob_cmd_run(&cmd);
 }
+
+

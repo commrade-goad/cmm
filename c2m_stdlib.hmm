@@ -55,7 +55,15 @@ typedef struct {
   const __type_t *type;
 } Opaque;
 
-/* Wrap a value in an Opaque (infer type automatically) */
+/* Wrap a value in an Opaque (infer type automatically).
+ * Note: `x` is evaluated twice by this expansion (once for its address,
+ * once for __type_of), so avoid side effects in the argument, e.g.
+ * opaque(arr[j++]) will increment j twice. A version using a
+ * statement-expression temporary to fix that was considered and
+ * rejected: da_push stores the whole (pointer, type) pair for later use
+ * rather than copying bytes out immediately, so `.data` has to point at
+ * something that outlives the call -- a temporary local to the
+ * statement-expression does not. */
 #define opaque(x) ((Opaque){ &(x), __type_of(x) })
 
 /* Runtime type assertion — compares kind + size + name (pointer not reliable) */
@@ -85,7 +93,7 @@ static void da_destroy (DynamicArray *da) {
   da->count = da->capacity = 0;
 }
 
-static void da_push (DynamicArray *da, Opaque val) {
+static void da_push_impl (DynamicArray *da, Opaque val) {
   assert (val.type->kind == da->element_type->kind
           && val.type->size == da->element_type->size
           && strcmp (val.type->name, da->element_type->name) == 0);
@@ -96,6 +104,11 @@ static void da_push (DynamicArray *da, Opaque val) {
   }
   da->items[da->count++] = val;
 }
+
+/* da_push(da, val) -- val is auto-boxed, no need to write opaque(val)
+ * yourself. Note val is evaluated twice (see opaque()'s own caveat
+ * above); avoid side effects in it. */
+#define da_push(da, val) da_push_impl ((da), opaque (val))
 
 static Opaque *da_get (DynamicArray *da, int i) {
   assert (i >= 0 && i < da->count);
@@ -142,7 +155,7 @@ static void hm_destroy (HashMap *hm) {
   hm->count = hm->capacity = 0;
 }
 
-static void hm_set (HashMap *hm, Opaque key, Opaque value) {
+static void hm_set_impl (HashMap *hm, Opaque key, Opaque value) {
   assert (key.type->kind == hm->key_type->kind && key.type->size == hm->key_type->size
           && strcmp (key.type->name, hm->key_type->name) == 0);
   assert (value.type->kind == hm->value_type->kind && value.type->size == hm->value_type->size
@@ -167,7 +180,12 @@ static void hm_set (HashMap *hm, Opaque key, Opaque value) {
   }
 }
 
-static void *hm_get (HashMap *hm, Opaque key) {
+/* hm_set(hm, key, value) -- key and value are auto-boxed, no need to
+ * write opaque(...) yourself. Both are evaluated twice (see opaque()'s
+ * caveat above); avoid side effects in them. */
+#define hm_set(hm, key, value) hm_set_impl ((hm), opaque (key), opaque (value))
+
+static void *hm_get_impl (HashMap *hm, Opaque key) {
   size_t ksize = hm->key_type->size;
   uint64_t hash = hm_hash (key.data, ksize);
   int mask = hm->capacity - 1;
@@ -180,11 +198,15 @@ static void *hm_get (HashMap *hm, Opaque key) {
   return NULL;
 }
 
-static int hm_has (HashMap *hm, Opaque key) {
-  return hm_get (hm, key) != NULL;
+#define hm_get(hm, key) hm_get_impl ((hm), opaque (key))
+
+static int hm_has_impl (HashMap *hm, Opaque key) {
+  return hm_get_impl (hm, key) != NULL;
 }
 
-static void hm_remove (HashMap *hm, Opaque key) {
+#define hm_has(hm, key) hm_has_impl ((hm), opaque (key))
+
+static void hm_remove_impl (HashMap *hm, Opaque key) {
   size_t ksize = hm->key_type->size;
   uint64_t hash = hm_hash (key.data, ksize);
   int mask = hm->capacity - 1;
@@ -198,6 +220,8 @@ static void hm_remove (HashMap *hm, Opaque key) {
     }
   }
 }
+
+#define hm_remove(hm, key) hm_remove_impl ((hm), opaque (key))
 
 static void hm_resize (HashMap *hm) {
   int old_cap = hm->capacity;
@@ -214,8 +238,8 @@ static void hm_resize (HashMap *hm) {
 
   for (int i = 0; i < old_cap; i++)
     if (old_slots[i] == 1)
-      hm_set (hm, (Opaque){ &old_keys[i * ksize], hm->key_type },
-                  (Opaque){ &old_values[i * vsize], hm->value_type });
+      hm_set_impl (hm, (Opaque){ &old_keys[i * ksize], hm->key_type },
+                       (Opaque){ &old_values[i * vsize], hm->value_type });
   free (old_slots); free (old_keys); free (old_values);
 }
 

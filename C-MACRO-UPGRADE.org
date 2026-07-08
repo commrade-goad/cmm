@@ -151,11 +151,11 @@ A block-scoping directive that fits the existing preprocessor style
 
 *** Visibility modes
 
-| Mode | Name | Effect on ~#include~ |
-|------+------+----------------------|
-| `private` | The name ~private~ | Preprocessor skips the entire region — text is never seen by includers. Macros, types, declarations all vanish. |
-| `public` | The name ~public~ | Default traditional behavior — everything visible. |
-| User-named | ~mylib~, ~math~, etc. | No visibility change, just grouping. Enables bulk ~#undefnamespace~. |
+| Mode       | Name                  | Effect on ~#include~                                                                                            |
+|------------+-----------------------+-----------------------------------------------------------------------------------------------------------------|
+| `private`  | The name ~private~    | Preprocessor skips the entire region — text is never seen by includers. Macros, types, declarations all vanish. |
+| `public`   | The name ~public~     | Default traditional behavior — everything visible.                                                              |
+| User-named | ~mylib~, ~math~, etc. | No visibility change, just grouping. Enables bulk ~#undefnamespace~.                                            |
 
 *** Private by deletion (the killer feature)
 

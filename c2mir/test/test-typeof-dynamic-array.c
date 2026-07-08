@@ -11,7 +11,7 @@ int main() {
 
   int vals[] = {10, 20, 30, 40, 50};
   for (int i = 0; i < 5; i++)
-    da_push(&da, opaque(vals[i]));
+    da_push(&da, vals[i]);
 
   printf("count=%d capacity=%d\n", da.count, da.capacity);
   for (int i = 0; i < da.count; i++) {

@@ -621,6 +621,7 @@ typedef enum {
   N_DEFER, /* extension: N_DEFER(N_LIST:(label)*, stmt) -- see `defer` keyword */
   N_TYPE_OF, /* __type_of(expr) → const __type_t * */
   N_TYPEOF,  /* typeof(expr) used as type specifier */
+  N_CALL_ARG, /* keyword arg in call: N_CALL_ARG(N_ID(name), expr) */
 } node_code_t;
 
 #undef REP_SEP
@@ -1766,8 +1767,7 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
               size_t i;
 
               curr_c = cs_get (c2m_ctx);
-              if (curr_c == '\n' || curr_c == EOF) {
-                if (curr_c == '\n') cs_unget (c2m_ctx, '\n');
+              if (curr_c == EOF) {
                 error (c2m_ctx, pos, "unterminated raw string literal");
                 VARR_PUSH (char, symbol_text, '"');
                 for (i = 0; i < hash_num; i++) VARR_PUSH (char, symbol_text, '#');
@@ -4406,7 +4406,27 @@ DA (post_expr_part) {
       list = new_node (c2m_ctx, N_LIST);
       if (!C (')')) {
         for (;;) {
-          P (assign_expr);
+          if (C ('.')) {
+            pos_t dot_pos;
+            node_t id_node;
+            MP ('.', dot_pos);
+            if (C (T_ID)) {
+              id_node = curr_token->node;
+              M (T_ID);
+              if (M ('=')) {
+                P (assign_expr);
+                r = new_pos_node2 (c2m_ctx, N_CALL_ARG, dot_pos, id_node, r);
+              } else {
+                error (c2m_ctx, dot_pos, "expected '=' after '.name' in keyword argument");
+                r = new_node (c2m_ctx, N_IGNORE);
+              }
+            } else {
+              error (c2m_ctx, dot_pos, "expected identifier after '.' in keyword argument");
+              r = new_node (c2m_ctx, N_IGNORE);
+            }
+          } else {
+            P (assign_expr);
+          }
           op_append (c2m_ctx, list, r);
           if (!M (',')) break;
         }
@@ -5154,6 +5174,20 @@ D (param_type_list) {
       if (attrs == err_node) attrs = new_node (c2m_ctx, N_IGNORE);
       r = new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (op2), op1, r, attrs,
                          new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE));
+    }
+    if (M ('=')) {
+      if (r->code != N_SPEC_DECL) {
+        error (c2m_ctx, curr_token->pos, "default value requires a named parameter");
+        r = new_node (c2m_ctx, N_IGNORE);
+      } else {
+        node_t spec_node = r, def;
+        P (assign_expr);
+        def = r;
+        r = new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (spec_node),
+                           NL_EL (spec_node->u.ops, 0), NL_EL (spec_node->u.ops, 1),
+                           NL_EL (spec_node->u.ops, 2), def,
+                           NL_EL (spec_node->u.ops, 4));
+      }
     }
     op_append (c2m_ctx, list, r);
     comma_p = FALSE;
@@ -9649,22 +9683,109 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       break;
     }
     saved_call_arg_area_offset_before_args = curr_call_arg_area_offset;
-    for (arg = first_arg; arg != NULL; arg = NL_NEXT (arg)) {
-      check (c2m_ctx, arg, r);
-      e2 = arg->attr;
-      if (start_param == NULL || start_param->code == N_ID) continue; /* no params or ident list */
-      if (param == NULL) {
-        if (!func_type->dots_p) error (c2m_ctx, POS (arg), "too many arguments");
-        start_param = NULL; /* ignore the rest args */
-        continue;
-      }
-      assert (param->code == N_SPEC_DECL || param->code == N_TYPE);
-      decl_spec = get_param_decl_spec (param);
-      check_assignment_types (c2m_ctx, decl_spec->type, NULL, e2, r);
-      param = NL_NEXT (param);
+
+    /* Count named parameters (excluding void and dots) */
+    int n_params = 0;
+    node_t params_list[128];
+    for (param = start_param; param != NULL; param = NL_NEXT (param)) {
+      if (param->code == N_DOTS) break;
+      if (void_param_p (param)) break;
+      params_list[n_params++] = param;
     }
+
+    /* Resolve args to positional slots, injecting defaults where needed */
+    struct { node_t arg; int filled; } resolved[128];
+    for (int i = 0; i < n_params; i++) resolved[i].filled = 0;
+    int seen_kw = 0, pi = 0, vararg_overflow = 0;
+
+    for (arg = first_arg; arg != NULL; arg = NL_NEXT (arg)) {
+      if (arg->code == N_CALL_ARG) {
+        seen_kw = 1;
+        node_t name_node = NL_HEAD (arg->u.ops);
+        node_t val_node = NL_NEXT (name_node);
+        const char *name = name_node->u.s.s;
+        int found = 0;
+        for (int j = 0; j < n_params; j++) {
+          node_t pdecl = (params_list[j]->code == N_SPEC_DECL)
+                           ? NL_EL (params_list[j]->u.ops, 1) : NULL;
+          if (pdecl != NULL && pdecl->code == N_DECL) {
+            node_t pid = NL_HEAD (pdecl->u.ops);
+            if (pid->code == N_ID && strcmp (pid->u.s.s, name) == 0) {
+              if (resolved[j].filled)
+                error (c2m_ctx, POS (r), "duplicate keyword argument '.%s'", name);
+              resolved[j].arg = val_node;
+              resolved[j].filled = 1;
+              found = 1;
+              break;
+            }
+          }
+        }
+        if (!found)
+          error (c2m_ctx, POS (r), "unknown keyword argument '.%s'", name);
+      } else {
+        if (seen_kw)
+          error (c2m_ctx, POS (r), "positional argument after keyword argument");
+        if (pi >= n_params) {
+          if (!func_type->dots_p)
+            error (c2m_ctx, POS (r), "too many arguments");
+          vararg_overflow = 1;
+          break;
+        }
+        resolved[pi].arg = arg;
+        resolved[pi].filled = 1;
+        pi++;
+      }
+    }
+
+    /* Fill defaults for unfilled slots */
+    int any_default = 0;
+    for (int i = 0; i < n_params; i++) {
+      if (!resolved[i].filled) {
+        node_t def = (params_list[i]->code == N_SPEC_DECL)
+                       ? NL_EL (params_list[i]->u.ops, 3) : NULL;
+        if (def != NULL && def->code != N_IGNORE) {
+          resolved[i].arg = copy_node (c2m_ctx, def);
+          resolved[i].filled = 1;
+          any_default = 1;
+        } else {
+          error (c2m_ctx, POS (r), "too few arguments");
+        }
+      }
+    }
+
+    /* Build clean positional arg list (no N_CALL_ARG) for codegen */
+    if (any_default || first_arg != NULL) {
+      node_t arg_list = NL_EL (r->u.ops, 1);
+      DLIST_INIT (node_t, arg_list->u.ops); /* clear existing args */
+      for (int i = 0; i < n_params; i++)
+        if (resolved[i].filled)
+          op_append (c2m_ctx, arg_list, resolved[i].arg);
+      /* Append vararg args beyond named params */
+      if (vararg_overflow && arg != NULL) {
+        for (; arg != NULL; arg = NL_NEXT (arg))
+          op_append (c2m_ctx, arg_list, arg);
+      }
+    }
+    /* Update first_arg to the clean list */
+    first_arg = NL_HEAD (NL_EL (r->u.ops, 1)->u.ops);
+
+    /* Type-check the resolved positional args */
+    int j;
+    node_t clean_arg, clean_param;
+    for (j = 0, clean_arg = first_arg, clean_param = start_param;
+         clean_arg != NULL && clean_param != NULL && j < n_params;
+         j++, clean_arg = NL_NEXT (clean_arg), clean_param = NL_NEXT (clean_param)) {
+      check (c2m_ctx, clean_arg, r);
+      e2 = clean_arg->attr;
+      decl_spec = get_param_decl_spec (clean_param);
+      check_assignment_types (c2m_ctx, decl_spec->type, NULL, e2, r);
+    }
+    /* Check remaining args (varargs) */
+    for (; clean_arg != NULL; clean_arg = NL_NEXT (clean_arg)) {
+      check (c2m_ctx, clean_arg, r);
+    }
+
     curr_call_arg_area_offset = saved_call_arg_area_offset_before_args;
-    if (param != NULL) error (c2m_ctx, POS (r), "too few arguments");
     break;
   }
   case N_GENERIC: {
@@ -14166,6 +14287,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP3 (C, MODULE, ASM, ATTR);
+    C (CALL_ARG);
   default: abort ();
   }
 #undef C

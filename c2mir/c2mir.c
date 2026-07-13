@@ -2084,6 +2084,10 @@ typedef VARR (token_t) * token_arr_t;
 
 DEF_VARR (token_arr_t);
 
+typedef struct { const char *label; unsigned seq; } fresh_label_t;
+
+DEF_VARR (fresh_label_t);
+
 typedef struct macro_call {
   macro_t macro;
   pos_t pos;
@@ -2091,7 +2095,7 @@ typedef struct macro_call {
   VARR (token_arr_t) * args;
   int repl_pos;                 /* position in macro replacement */
   VARR (token_t) * repl_buffer; /* LIST:(token nodes)* */
-  unsigned fresh_seq;           /* sequence number for __fresh__ in this expansion */
+  VARR (fresh_label_t) * fresh_labels; /* per-label seqs for __fresh__(label) */
 } *macro_call_t;
 
 DEF_VARR (macro_call_t);
@@ -2240,13 +2244,14 @@ static macro_call_t new_macro_call (MIR_alloc_t alloc, macro_t m, pos_t pos) {
   mc->pos = pos;
   mc->repl_pos = 0;
   mc->args = NULL;
-  mc->fresh_seq = 0;
+  VARR_CREATE (fresh_label_t, mc->fresh_labels, alloc, 2);
   VARR_CREATE (token_t, mc->repl_buffer, alloc, 64);
   return mc;
 }
 
 static void free_macro_call (macro_call_t mc) {
   VARR_DESTROY (token_t, mc->repl_buffer);
+  VARR_DESTROY (fresh_label_t, mc->fresh_labels);
   if (mc->args != NULL) {
     while (VARR_LENGTH (token_arr_t, mc->args) != 0) {
       VARR (token_t) *arg = VARR_POP (token_arr_t, mc->args);
@@ -2999,9 +3004,52 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
     if (copy_p) t = copy_token (c2m_ctx, t, mc->pos);
     if (t->code == T_ID && strcmp (t->repr, "__fresh__") == 0) {
       char buf[64];
-      if (mc->fresh_seq == 0) mc->fresh_seq = ++fresh_counter;
-      snprintf (buf, sizeof (buf), "__fresh_%u", mc->fresh_seq);
-      t = new_id_token (c2m_ctx, t->pos, buf);
+      /* Check for __fresh__(label) syntax */
+      if (mc->repl_pos + 2 < m_repl_len
+          && m_repl[mc->repl_pos]->code == '('
+          && m_repl[mc->repl_pos + 1]->code == T_ID
+          && m_repl[mc->repl_pos + 2]->code == ')') {
+        const char *label = m_repl[mc->repl_pos + 1]->repr;
+        unsigned seq = 0;
+        fresh_label_t *fl;
+        unsigned i, n = VARR_LENGTH (fresh_label_t, mc->fresh_labels);
+        fl = VARR_ADDR (fresh_label_t, mc->fresh_labels);
+        for (i = 0; i < n; i++)
+          if (strcmp (fl[i].label, label) == 0) {
+            seq = fl[i].seq;
+            break;
+          }
+        if (seq == 0) {
+          fresh_label_t new_fl;
+          seq = ++fresh_counter;
+          new_fl.label = label;
+          new_fl.seq = seq;
+          VARR_PUSH (fresh_label_t, mc->fresh_labels, new_fl);
+        }
+        snprintf (buf, sizeof (buf), "__fresh_%u_%s", seq, label);
+        t = new_id_token (c2m_ctx, t->pos, buf);
+        mc->repl_pos += 3;  /* consume ( label ) */
+      } else {
+        /* Bare __fresh__ — existing behaviour: all bare in same expansion share one seq */
+        unsigned seq = 0;
+        fresh_label_t *fl;
+        unsigned i, n = VARR_LENGTH (fresh_label_t, mc->fresh_labels);
+        fl = VARR_ADDR (fresh_label_t, mc->fresh_labels);
+        for (i = 0; i < n; i++)
+          if (fl[i].label[0] == '\0') {
+            seq = fl[i].seq;
+            break;
+          }
+        if (seq == 0) {
+          fresh_label_t new_fl;
+          seq = ++fresh_counter;
+          new_fl.label = "";
+          new_fl.seq = seq;
+          VARR_PUSH (fresh_label_t, mc->fresh_labels, new_fl);
+        }
+        snprintf (buf, sizeof (buf), "__fresh_%u", seq);
+        t = new_id_token (c2m_ctx, t->pos, buf);
+      }
     }
     add_token (mc->repl_buffer, t);
   }

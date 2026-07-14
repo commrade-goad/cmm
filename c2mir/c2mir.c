@@ -9696,10 +9696,11 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     /* Resolve args to positional slots, injecting defaults where needed */
     struct { node_t arg; int filled; } resolved[128];
     for (int i = 0; i < n_params; i++) resolved[i].filled = 0;
-    int seen_kw = 0, pi = 0, vararg_overflow = 0;
+    int needs_rebuild = 0, seen_kw = 0, pi = 0, vararg_overflow = 0;
 
     for (arg = first_arg; arg != NULL; arg = NL_NEXT (arg)) {
       if (arg->code == N_CALL_ARG) {
+        needs_rebuild = 1;
         seen_kw = 1;
         node_t name_node = NL_HEAD (arg->u.ops);
         node_t val_node = NL_NEXT (name_node);
@@ -9747,6 +9748,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
           resolved[i].arg = copy_node (c2m_ctx, def);
           resolved[i].filled = 1;
           any_default = 1;
+          needs_rebuild = 1;
         } else {
           error (c2m_ctx, POS (r), "too few arguments");
         }
@@ -9754,7 +9756,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     }
 
     /* Build clean positional arg list (no N_CALL_ARG) for codegen */
-    if (any_default || first_arg != NULL) {
+    if (needs_rebuild) {
       node_t arg_list = NL_EL (r->u.ops, 1);
       DLIST_INIT (node_t, arg_list->u.ops); /* clear existing args */
       for (int i = 0; i < n_params; i++)

@@ -11,6 +11,7 @@ just a fork of c2mir from the [MIR](https://github.com/vnmakarov/mir) project th
 7. Default value on function, so you can do `void do_something(int a = 10);`
 8. Function calling with unordered args, so you can do `do_something(.a = 20);`
 9. Auto inference using the `:` syntax, example: `h := "Hello World";`
+10. Now the () on the `if` and its friend is not mandatory you can just emit them... (for `for` -> exp1;exp2;exp3;)
 
 
 ## Build

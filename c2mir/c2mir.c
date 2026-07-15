@@ -293,6 +293,7 @@ enum type_mode {
   TM_UNION,
   TM_ARR,
   TM_FUNC,
+  TM_AUTO, /* extension: placeholder for `ident := expr` before type inference resolves it */
 };
 
 struct type {
@@ -583,6 +584,7 @@ typedef enum {
   T_DEFER, /* extension keyword: `defer <stmt>;` */
   T___TYPE_OF, /* extension: __type_of(expr) -> const __type_t * */
   T___FRESH__, /* extension: __fresh__ - hygienic macro temp identifier */
+  T_COLASSIGN, /* extension: ':=' for auto type inference declarations */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -622,6 +624,7 @@ typedef enum {
   N_TYPE_OF, /* __type_of(expr) → const __type_t * */
   N_TYPEOF,  /* typeof(expr) used as type specifier */
   N_CALL_ARG, /* keyword arg in call: N_CALL_ARG(N_ID(name), expr) */
+  N_AUTO_INFER, /* extension: marker decl-spec for `ident := expr;` auto type inference */
 } node_code_t;
 
 #undef REP_SEP
@@ -896,6 +899,7 @@ static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
   case T_ARROW: return "->";
   case T_UNOP: return "unary op";
   case T_DOTS: return "...";
+  case T_COLASSIGN: return ":=";
   default:
     if ((s = str_find_by_key (c2m_ctx, token_code)) != NULL) return s;
     if (isprint (token_code))
@@ -1621,6 +1625,9 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
       curr_c = cs_get (c2m_ctx);
       if (curr_c == '>') {
         return new_token (c2m_ctx, cs->pos, ":>", ']', N_IGNORE);
+      } else if (curr_c == '=') {
+        /* extension: ':=' -- auto type inference declaration */
+        return new_token (c2m_ctx, cs->pos, ":=", T_COLASSIGN, N_IGNORE);
       } else {
         cs_unget (c2m_ctx, curr_c);
         return new_token (c2m_ctx, cs->pos, ":", ':', N_IGNORE);
@@ -4623,6 +4630,29 @@ D (declaration) {
   node_t op, list, decl, spec, r, attrs, asm_part = NULL;
   pos_t pos, last_pos;
 
+  if (C (T_ID) && VARR_GET (token_t, recorded_tokens, next_token_index)->code == T_COLASSIGN) {
+    /* extension: `ident := expr ;` -- declaration with type inferred from the initializer.
+       Desugars to the equivalent of a N_SPEC_DECL with a single N_AUTO_INFER decl-spec;
+       the real type is filled in from the initializer's type in create_decl.  */
+    node_t id, decl_node, spec_list;
+    pos_t id_pos = curr_token->pos;
+
+    MN (T_ID, id);
+    PT (T_COLASSIGN);
+    P (assign_expr); /* initializer; brace-enclosed initializer lists are not supported here */
+    spec_list = new_node (c2m_ctx, N_LIST);
+    op_append (c2m_ctx, spec_list, new_pos_node (c2m_ctx, N_AUTO_INFER, id_pos));
+    decl_node = new_pos_node2 (c2m_ctx, N_DECL, id_pos, id, new_node (c2m_ctx, N_LIST));
+    tpname_add (c2m_ctx, id, curr_scope, FALSE);
+    list = new_node (c2m_ctx, N_LIST);
+    op_append (c2m_ctx, list,
+               new_pos_node5 (c2m_ctx, N_SPEC_DECL, id_pos, new_node1 (c2m_ctx, N_SHARE, spec_list),
+                              decl_node, new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
+                              r));
+    r = list;
+    PT (';');
+    return r;
+  }
   if (C (T_STATIC_ASSERT)) {
     P (st_assert);
   } else if (MP (';', pos)) {
@@ -7198,6 +7228,12 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       if (ds != NULL) *type = *ds->type;
       break;
     }
+    case N_AUTO_INFER:
+      /* extension: `ident := expr` -- type is inferred later from the initializer,
+         in create_decl, before it is otherwise used.  */
+      set_type_pos_node (type, n);
+      type->mode = TM_AUTO;
+      break;
     default: abort ();
     }
   if (type->mode == TM_BASIC && type->u.basic_type == TP_UNDEF) {
@@ -8172,10 +8208,13 @@ static void init_decl (c2m_ctx_t c2m_ctx, decl_t decl) {
   decl->c2m_ctx = c2m_ctx;
 }
 
+static struct type *adjust_type (c2m_ctx_t c2m_ctx, struct type *type);
+
 static void create_decl (c2m_ctx_t c2m_ctx, node_t scope, node_t decl_node,
                          struct decl_spec decl_spec, node_t initializer, int param_p) {
   check_ctx_t check_ctx = c2m_ctx->check_ctx;
   int func_def_p = decl_node->code == N_FUNC_DEF, func_p = FALSE;
+  int auto_inferred_p = FALSE;
   node_t id = NULL; /* to remove an uninitialized warning */
   node_t list_head, declarator;
   struct type *type;
@@ -8193,6 +8232,29 @@ static void create_decl (c2m_ctx_t c2m_ctx, node_t scope, node_t decl_node,
     decl->decl_spec.linkage = N_IGNORE;
   } else {
     assert (declarator->code == N_DECL);
+    if (decl->decl_spec.type->mode == TM_AUTO) {
+      /* extension: `ident := expr` -- infer the type from the initializer now,
+         before the type is used by check_declarator/check_type/etc. below. */
+      if (initializer == NULL || initializer->code == N_IGNORE) {
+        error (c2m_ctx, POS (decl_node), "auto-inferred declaration requires an initializer");
+        decl->decl_spec.type->mode = TM_BASIC;
+        decl->decl_spec.type->u.basic_type = TP_INT;
+      } else {
+        struct expr *init_e;
+        struct type *init_t;
+
+        check (c2m_ctx, initializer, decl_node);
+        init_e = initializer->attr;
+        init_t = init_e->type;
+        if (init_t->mode == TM_ARR || init_t->mode == TM_FUNC)
+          init_t = adjust_type (c2m_ctx, init_t); /* decay array/function like a value copy would */
+        if (init_t->mode == TM_BASIC && init_t->u.basic_type == TP_VOID)
+          error (c2m_ctx, POS (initializer), "cannot infer type from a void expression");
+        *decl->decl_spec.type = *init_t;
+        decl->decl_spec.type->type_item = NULL; /* do not alias initializer's type descriptor */
+        auto_inferred_p = TRUE;
+      }
+    }
     type = check_declarator (c2m_ctx, declarator, func_def_p);
     decl->decl_spec.type = append_type (type, decl->decl_spec.type);
   }
@@ -8237,7 +8299,7 @@ static void create_decl (c2m_ctx_t c2m_ctx, node_t scope, node_t decl_node,
            id->u.s.s);
     return;
   }
-  check (c2m_ctx, initializer, decl_node);
+  if (!auto_inferred_p) check (c2m_ctx, initializer, decl_node);
   check_initializer (c2m_ctx, NULL, &decl->decl_spec.type, initializer,
                      decl->decl_spec.linkage == N_STATIC || decl->decl_spec.linkage == N_EXTERN
                        || decl->decl_spec.thread_local_p || decl->decl_spec.static_p,

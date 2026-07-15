@@ -8,6 +8,9 @@ just a fork of c2mir from the [MIR](https://github.com/vnmakarov/mir) project th
 4. Simple macro update with `__fresh__` so no more macro name clash
 5. Auto deref so we dont mandate `->` use `.` and it will work just fine
 6. auto include guard you dont need to add `ifndef` circus on header
+7. Default value on function, so you can do `void do_something(int a = 10);`
+8. Function calling with unordered args, so you can do `do_something(.a = 20);`
+9. Auto inference using the `:` syntax, example: `h := "Hello World";`
 
 
 ## Build

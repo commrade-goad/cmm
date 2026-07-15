@@ -56,8 +56,10 @@ int main(int argc, char **argv) {
 
     if (!nob_procs_flush(&procs)) return 1;
 
-    if (!nob_needs_rebuild(exe, objs, nsrcs))
+    if (!nob_needs_rebuild(exe, objs, nsrcs)) {
+        printf(r"No need for rebuilds." "\n");
         return 0;
+    }
 
     nob_cmd_append(&cmd, CC, "-o", exe);
     for (int i = 0; i < nsrcs; i++)

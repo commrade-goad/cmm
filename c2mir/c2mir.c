@@ -5479,10 +5479,14 @@ D (stmt) {
       NL_PREPEND (r->u.ops, l);
     }
   } else if (MP (T_IF, pos)) { /* selection-statement */
-//    PT ('(');
+    int isModern = 1;
+    if ( C ('(') ) { PT ('('); isModern = 0; }
+
     P (expr);
     op1 = r;
-//    PT (')');
+
+    if (!isModern) PT (')');
+
     P (stmt);
     op2 = r;
     if (!M (T_ELSE)) {
@@ -5492,30 +5496,42 @@ D (stmt) {
     }
     r = new_pos_node4 (c2m_ctx, N_IF, pos, l, op1, op2, r);
   } else if (MP (T_SWITCH, pos)) { /* selection-statement */
-//    PT ('(');
+    int isModern = 1;
+    if ( C ('(') ) { PT ('('); isModern = 0; }
+
     P (expr);
     op1 = r;
-//    PT (')');
+
+    if (!isModern) PT (')');
+
     P (stmt);
     r = new_pos_node3 (c2m_ctx, N_SWITCH, pos, l, op1, r);
   } else if (MP (T_WHILE, pos)) { /* iteration-statement */
-//    PT ('(');
+    int isModern = 1;
+    if ( C ('(') ) { PT ('('); isModern = 0; }
+
     P (expr);
     op1 = r;
-//    PT (')');
+
+    if (!isModern) PT (')');
+
     P (stmt);
     r = new_pos_node3 (c2m_ctx, N_WHILE, pos, l, op1, r);
   } else if (M (T_DO)) { /* iteration-statement */
     P (stmt);
     op1 = r;
     PTP (T_WHILE, pos);
-//    PT ('(');
+    int isModern = 1;
+    if ( C ('(') ) { PT ('('); isModern = 0; }
+
     P (expr);
-//    PT (')');
+
+    if (!isModern) PT (')');
+
     PT (';');
     r = new_pos_node3 (c2m_ctx, N_DO, pos, l, r, op1);
   } else if (MP (T_FOR, pos)) { /* iteration-statement */
-    int isModern = !C ( '(');
+    int isModern = !C ( '(' );
     if (!isModern) PT ('(');
     n = new_pos_node (c2m_ctx, N_FOR, pos);
     n->attr = curr_scope;

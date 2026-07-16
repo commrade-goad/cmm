@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
     if (!nob_procs_flush(&procs)) return 1;
 
     if (!nob_needs_rebuild(exe, objs, nsrcs)) {
-        printf(r"No need for rebuilds." "\n");
+      // printf(r"No need for rebuilds." "\n");
         return 0;
     }
 

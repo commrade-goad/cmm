@@ -6,13 +6,13 @@
 #endif
 
 const char *cflags[] = {
-    "-I.", "-MMD", "-MP", "-fPIC", "-g", "-std=gnu11",
+    "-Ilua-5.5.0/src", "-Llua-5.5.0/src", "-l:liblua.a", "-I.", "-MMD", "-MP", "-fPIC", "-g", "-std=gnu11",
     "-Wno-abi", "-fsigned-char", "-fno-tree-sra", "-fno-ipa-cp-clone",
-    "-O3", "-DNDEBUG", "-DC2MIR_PARALLEL",
+    "-O2", "-DNDEBUG", "-DC2MIR_PARALLEL",
 };
 const int ncflags = sizeof cflags / sizeof cflags[0];
 
-const char *ldflags[] = {"-llua", "-lm", "-ldl", "-lpthread"};
+const char *ldflags[] = {"-Llua-5.5.0/src", "-l:liblua.a", "-lm", "-ldl", "-lpthread"};
 const int nldflags = sizeof ldflags / sizeof ldflags[0];
 
 const char *srcs[] = {
@@ -26,6 +26,11 @@ const char *objs[4];
 int main(int argc, char **argv) {
     // NOB_GO_REBUILD_URSELF(argc, argv);
     nob_shift(argv, argc);
+
+    // Build lua first
+    Nob_Cmd cmd_lua = {0};
+    nob_cmd_append(&cmd_lua, "make", "-C", "lua-5.5.0/", "-j4");
+    if (!nob_cmd_run(&cmd_lua)) return 1;
 
     for (int i = 0; i < nsrcs; i++) {
         snprintf(obj_bufs[i], sizeof obj_bufs[i], "%s.o", srcs[i]);

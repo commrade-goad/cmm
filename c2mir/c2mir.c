@@ -22,6 +22,7 @@
 #include <setjmp.h>
 #include <math.h>
 #include <wchar.h>
+#include <lualib.h>
 #include "mir-alloc.h"
 #include "mir.h"
 #include "time.h"

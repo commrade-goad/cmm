@@ -171,6 +171,10 @@ struct c2m_ctx {
   struct parse_ctx *parse_ctx;
   struct check_ctx *check_ctx;
   struct gen_ctx *gen_ctx;
+  void *lua_state; /* persistent Lua VM shared across every @{ } in this TU,
+                       so functions/globals defined in one macro block are
+                       visible to later ones. Lazily created, closed in
+                       c2mir_compile's cleanup. */
 };
 
 typedef struct c2m_ctx *c2m_ctx_t;
@@ -585,6 +589,7 @@ typedef enum {
   T___TYPE_OF, /* extension: __type_of(expr) -> const __type_t * */
   T___FRESH__, /* extension: __fresh__ - hygienic macro temp identifier */
   T_COLASSIGN, /* extension: ':=' for auto type inference declarations */
+  T_LUA_MACRO, /* extension: @{ lua code } -> spliced AST node */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -826,6 +831,286 @@ static node_t new_str_node (c2m_ctx_t c2m_ctx, node_code_t nc, str_t s, pos_t p)
   n->u.s = s;
   return n;
 }
+
+/* ===================== BEGIN LUA MACRO BINDINGS ===================== */
+static void error (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...);
+static str_t uniq_str (c2m_ctx_t c2m_ctx, const char *str, size_t len);
+#include <lua5.4/lua.h>
+#include <lua5.4/lauxlib.h>
+#include <lua5.4/lualib.h>
+
+#define NODE_MT "cmm.node_t"
+#define REGKEY_CTX "cmm_ctx"
+#define REGKEY_POS "cmm_pos_box"
+
+static c2m_ctx_t get_bound_ctx (lua_State *L) {
+  lua_getfield (L, LUA_REGISTRYINDEX, REGKEY_CTX);
+  c2m_ctx_t ctx = (c2m_ctx_t) lua_touserdata (L, -1);
+  lua_pop (L, 1);
+  return ctx;
+}
+static pos_t get_bound_pos (lua_State *L) {
+  lua_getfield (L, LUA_REGISTRYINDEX, REGKEY_POS);
+  pos_t *box = (pos_t *) lua_touserdata (L, -1);
+  lua_pop (L, 1);
+  return *box;
+}
+static node_t check_lua_node (lua_State *L, int idx) {
+  if (lua_isnil (L, idx)) return NULL;
+  void *p = luaL_checkudata (L, idx, NODE_MT);
+  return *(node_t *) p;
+}
+static void push_lua_node (lua_State *L, node_t n) {
+  node_t *p = (node_t *) lua_newuserdata (L, sizeof (node_t));
+  *p = n;
+  luaL_getmetatable (L, NODE_MT);
+  lua_setmetatable (L, -2);
+}
+
+#define LUA_NAME_PAIR(n) {#n, N_##n}
+#define REP_SEP ,
+static const struct { const char *name; node_code_t code; } lua_node_name_table[] = {
+  REP8 (LUA_NAME_PAIR, IGNORE, I, L, LL, U, UL, ULL, F),
+  REP8 (LUA_NAME_PAIR, D, LD, CH, CH16, CH32, STR, STR16, STR32),
+  REP5 (LUA_NAME_PAIR, ID, COMMA, ANDAND, OROR, STMTEXPR),
+  REP8 (LUA_NAME_PAIR, EQ, NE, LT, LE, GT, GE, ASSIGN, BITWISE_NOT),
+  REP8 (LUA_NAME_PAIR, NOT, AND, AND_ASSIGN, OR, OR_ASSIGN, XOR, XOR_ASSIGN, LSH),
+  REP8 (LUA_NAME_PAIR, LSH_ASSIGN, RSH, RSH_ASSIGN, ADD, ADD_ASSIGN, SUB, SUB_ASSIGN, MUL),
+  REP8 (LUA_NAME_PAIR, MUL_ASSIGN, DIV, DIV_ASSIGN, MOD, MOD_ASSIGN, IND, FIELD, ADDR),
+  REP8 (LUA_NAME_PAIR, DEREF, DEREF_FIELD, COND, INC, DEC, POST_INC, POST_DEC, ALIGNOF),
+  REP8 (LUA_NAME_PAIR, SIZEOF, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC, IF),
+  REP8 (LUA_NAME_PAIR, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE, BREAK),
+  REP8 (LUA_NAME_PAIR, RETURN, EXPR, BLOCK, CASE, DEFAULT, LABEL, LABEL_ADDR, LIST),
+  REP8 (LUA_NAME_PAIR, SPEC_DECL, SHARE, TYPEDEF, EXTERN, STATIC, AUTO, REGISTER, THREAD_LOCAL),
+  REP8 (LUA_NAME_PAIR, DECL, VOID, CHAR, SHORT, INT, LONG, FLOAT, DOUBLE),
+  REP8 (LUA_NAME_PAIR, SIGNED, UNSIGNED, BOOL, STRUCT, UNION, ENUM, ENUM_CONST, MEMBER),
+  REP8 (LUA_NAME_PAIR, CONST, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC),
+  REP8 (LUA_NAME_PAIR, STAR, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT),
+  REP4 (LUA_NAME_PAIR, FUNC_DEF, MODULE, ASM, ATTR),
+  {"DEFER", N_DEFER}, {"TYPE_OF", N_TYPE_OF}, {"TYPEOF", N_TYPEOF},
+  {"CALL_ARG", N_CALL_ARG}, {"AUTO_INFER", N_AUTO_INFER},
+};
+#undef REP_SEP
+#define LUA_NODE_NAME_TABLE_LEN (sizeof (lua_node_name_table) / sizeof (lua_node_name_table[0]))
+
+/* Fixed arities, derived by grepping every real new_node[1-5]/new_pos_node[1-5]
+   call site for each N_XXX in the actual parser (not guessed). -1 means
+   "variable arity / not yet audited" -- ast.new skips the check for those
+   (matches today's unchecked behavior). This list is NOT exhaustive --
+   only nodes actually exercised by grep are covered. Extend as needed;
+   getting this wrong fails loud in Lua now instead of segfaulting deep
+   in check(), which is the whole point. */
+/* Fixed arities, cross-checked against the grammar doc comment at the
+   top of this file (search "Parser Start") AND the actual construction
+   site for every entry (some nodes build incrementally via op_append
+   rather than a single new_pos_nodeN call -- N_COND, N_FOR -- so the
+   doc comment alone isn't trusted blindly).
+   Deliberately EXCLUDED: N_ADD, N_SUB (same node code used for both
+   unary +/- [1 op] and binary +/- [2 ops] -- genuinely dual-arity,
+   can't be validated with a single number) and N_CASE (1 op for plain
+   `case x:`, 2 ops for GNU case-range `case x ... y:` -- same deal).
+   -1 (i.e. absent from this table) means unaudited / unchecked, same
+   as today's behavior -- extend this table as more nodes get exercised
+   by real macros instead of guessing ahead of need. */
+static const struct { const char *name; int arity; } lua_node_arity_table[] = {
+  /* expr */
+  {"LABEL_ADDR", 1}, {"MUL", 2}, {"DIV", 2}, {"MOD", 2}, {"LSH", 2}, {"RSH", 2},
+  {"NOT", 1}, {"BITWISE_NOT", 1}, {"INC", 1}, {"DEC", 1}, {"POST_INC", 1}, {"POST_DEC", 1},
+  {"ALIGNOF", 1}, {"SIZEOF", 1}, {"EXPR_SIZEOF", 1}, {"CAST", 2}, {"COMMA", 2},
+  {"ANDAND", 2}, {"OROR", 2}, {"EQ", 2}, {"NE", 2}, {"LT", 2}, {"LE", 2}, {"GT", 2}, {"GE", 2},
+  {"AND", 2}, {"OR", 2}, {"XOR", 2},
+  {"ASSIGN", 2}, {"ADD_ASSIGN", 2}, {"SUB_ASSIGN", 2}, {"MUL_ASSIGN", 2}, {"DIV_ASSIGN", 2},
+  {"MOD_ASSIGN", 2}, {"LSH_ASSIGN", 2}, {"RSH_ASSIGN", 2}, {"AND_ASSIGN", 2}, {"OR_ASSIGN", 2},
+  {"XOR_ASSIGN", 2},
+  {"DEREF", 1}, {"ADDR", 1}, {"IND", 2}, {"FIELD", 2}, {"DEREF_FIELD", 2},
+  {"COND", 3}, /* ternary: cond, then, else -- built incrementally, verified at pre_cond_expr */
+  {"COMPOUND_LITERAL", 2}, {"CALL", 2}, {"GENERIC", 2}, {"GENERIC_ASSOC", 2}, {"STMTEXPR", 1},
+  /* label */
+  {"DEFAULT", 0}, {"LABEL", 1},
+  /* stmt */
+  {"IF", 4}, {"SWITCH", 3}, {"WHILE", 3}, {"DO", 3},
+  {"FOR", 5}, /* labels, init, cond, post, body -- verified at T_FOR parsing, incremental op_append */
+  {"GOTO", 2}, {"INDIRECT_GOTO", 2}, {"CONTINUE", 1}, {"BREAK", 1},
+  {"RETURN", 2}, {"EXPR", 2},
+  /* compound_stmt */
+  {"BLOCK", 2},
+  {"ASM", 1}, {"ATTR", 2},
+  {"SPEC_DECL", 5}, {"ST_ASSERT", 2}, {"ALIGNAS", 1},
+  {"STRUCT", 2}, {"UNION", 2}, {"ENUM", 2}, {"ENUM_CONST", 2}, {"MEMBER", 4},
+  {"DECL", 2}, {"POINTER", 1}, {"FUNC", 1}, {"ARR", 3},
+  {"INIT", 2}, {"FIELD_ID", 1}, {"TYPE", 2}, {"SHARE", 1},
+  {"MODULE", 1}, {"FUNC_DEF", 4},
+  {"TYPEOF", 1}, {"TYPE_OF", 1},
+  /* your own extensions, verified against their actual call sites */
+  {"DEFER", 2}, {"CALL_ARG", 2},
+};
+#define LUA_NODE_ARITY_TABLE_LEN (sizeof (lua_node_arity_table) / sizeof (lua_node_arity_table[0]))
+
+static int lua_node_expected_arity (const char *name) {
+  for (size_t i = 0; i < LUA_NODE_ARITY_TABLE_LEN; i++)
+    if (strcmp (lua_node_arity_table[i].name, name) == 0) return lua_node_arity_table[i].arity;
+  return -1; /* unaudited -- allow anything, same as before */
+}
+
+static int l_ast_new (lua_State *L) {
+  c2m_ctx_t c2m_ctx = get_bound_ctx (L);
+  pos_t p = get_bound_pos (L);
+  const char *name = luaL_checkstring (L, 1);
+  node_code_t code = N_IGNORE;
+  int found = 0;
+
+  for (size_t i = 0; i < LUA_NODE_NAME_TABLE_LEN; i++)
+    if (strcmp (lua_node_name_table[i].name, name) == 0) { code = lua_node_name_table[i].code; found = 1; break; }
+  if (!found) return luaL_error (L, "ast.new: unknown node type '%s'", name);
+
+  int nargs_given = lua_gettop (L) - 1; /* exclude the name arg */
+  int expected = lua_node_expected_arity (name);
+  if (expected >= 0 && nargs_given != expected)
+    return luaL_error (L, "ast.new('%s', ...): expects %d operand(s), got %d", name, expected, nargs_given);
+
+  node_t n = new_pos_node (c2m_ctx, code, p);
+  int nargs = lua_gettop (L);
+  for (int i = 2; i <= nargs; i++) {
+    node_t child = check_lua_node (L, i);
+    op_append (c2m_ctx, n, child == NULL ? new_pos_node (c2m_ctx, N_IGNORE, p) : child);
+  }
+  push_lua_node (L, n);
+  return 1;
+}
+
+#define LUA_INT_LEAF(luaname, cfn, ctype) \
+  static int l_ast_##luaname (lua_State *L) { \
+    c2m_ctx_t c2m_ctx = get_bound_ctx (L); \
+    pos_t p = get_bound_pos (L); \
+    ctype v = (ctype) luaL_checkinteger (L, 1); \
+    push_lua_node (L, cfn (c2m_ctx, v, p)); \
+    return 1; \
+  }
+LUA_INT_LEAF (i, new_i_node, long)
+LUA_INT_LEAF (l, new_l_node, long)
+LUA_INT_LEAF (ll, new_ll_node, long long)
+LUA_INT_LEAF (u, new_u_node, unsigned long)
+LUA_INT_LEAF (ul, new_ul_node, unsigned long)
+/* ull needs its own binding: Lua 5.4 ints are 64-bit *signed*, so
+   literals near UINT64_MAX (or hex like 0xFFFFFFFFFFFFFFFF) can't
+   round-trip through luaL_checkinteger. Accept a string for the
+   full-range case; still accept a plain number for the common case. */
+static int l_ast_ull (lua_State *L) {
+  c2m_ctx_t c2m_ctx = get_bound_ctx (L);
+  pos_t p = get_bound_pos (L);
+  unsigned long long v;
+  if (lua_type (L, 1) == LUA_TSTRING) {
+    const char *s = lua_tostring (L, 1);
+    char *end;
+    errno = 0;
+    v = strtoull (s, &end, 0); /* base 0: honors 0x/0 prefixes */
+    if (*end != '\0' || errno == ERANGE)
+      return luaL_error (L, "ast.ull: '%s' is not a valid uint64 literal", s);
+  } else {
+    v = (unsigned long long) luaL_checkinteger (L, 1);
+  }
+  push_lua_node (L, new_ull_node (c2m_ctx, v, p));
+  return 1;
+}
+LUA_INT_LEAF (ch, new_ch_node, int)
+LUA_INT_LEAF (ch16, new_ch16_node, mir_ulong)
+LUA_INT_LEAF (ch32, new_ch32_node, mir_ulong)
+#undef LUA_INT_LEAF
+
+#define LUA_FLOAT_LEAF(luaname, cfn, ctype) \
+  static int l_ast_##luaname (lua_State *L) { \
+    c2m_ctx_t c2m_ctx = get_bound_ctx (L); \
+    pos_t p = get_bound_pos (L); \
+    ctype v = (ctype) luaL_checknumber (L, 1); \
+    push_lua_node (L, cfn (c2m_ctx, v, p)); \
+    return 1; \
+  }
+LUA_FLOAT_LEAF (f, new_f_node, float)
+LUA_FLOAT_LEAF (d, new_d_node, double)
+LUA_FLOAT_LEAF (ld, new_ld_node, long double)
+#undef LUA_FLOAT_LEAF
+
+#define LUA_STR_LEAF(luaname, ncode) \
+  static int l_ast_##luaname (lua_State *L) { \
+    c2m_ctx_t c2m_ctx = get_bound_ctx (L); \
+    pos_t p = get_bound_pos (L); \
+    size_t len; \
+    const char *s = luaL_checklstring (L, 1, &len); \
+    push_lua_node (L, new_str_node (c2m_ctx, ncode, uniq_str (c2m_ctx, s, len + 1), p)); \
+    return 1; \
+  }
+LUA_STR_LEAF (id, N_ID)
+LUA_STR_LEAF (str, N_STR)
+LUA_STR_LEAF (str16, N_STR16)
+LUA_STR_LEAF (str32, N_STR32)
+#undef LUA_STR_LEAF
+
+static const luaL_Reg lua_ast_funcs[] = {
+  {"new", l_ast_new},
+  {"i", l_ast_i}, {"l", l_ast_l}, {"ll", l_ast_ll},
+  {"u", l_ast_u}, {"ul", l_ast_ul}, {"ull", l_ast_ull},
+  {"ch", l_ast_ch}, {"ch16", l_ast_ch16}, {"ch32", l_ast_ch32},
+  {"f", l_ast_f}, {"d", l_ast_d}, {"ld", l_ast_ld},
+  {"id", l_ast_id}, {"str", l_ast_str}, {"str16", l_ast_str16}, {"str32", l_ast_str32},
+  {NULL, NULL}
+};
+
+static void register_ast_bindings (lua_State *L, c2m_ctx_t c2m_ctx) {
+  luaL_newmetatable (L, NODE_MT);
+  lua_pop (L, 1);
+
+  /* ctx never changes for the lifetime of this lua_State -- store once. */
+  lua_pushlightuserdata (L, c2m_ctx);
+  lua_setfield (L, LUA_REGISTRYINDEX, REGKEY_CTX);
+
+  /* pos DOES change per @{ } call, but the box itself is allocated once
+     from c2m_ctx's own arena and mutated in place before each eval --
+     no per-call Lua allocation, no registry churn. */
+  pos_t *pos_box = (pos_t *) reg_malloc (c2m_ctx, sizeof (pos_t));
+  *pos_box = no_pos;
+  lua_pushlightuserdata (L, pos_box);
+  lua_setfield (L, LUA_REGISTRYINDEX, REGKEY_POS);
+
+  lua_newtable (L);
+  for (const luaL_Reg *r = lua_ast_funcs; r->name != NULL; r++) {
+    lua_pushcfunction (L, r->func);
+    lua_setfield (L, -2, r->name);
+  }
+  lua_setglobal (L, "ast");
+}
+
+static node_t get_macro_result (lua_State *L) {
+  if (lua_gettop (L) == 0) return NULL;
+  return check_lua_node (L, -1);
+}
+
+static node_t eval_lua_macro (c2m_ctx_t c2m_ctx, const char *lua_src, pos_t pos) {
+  lua_State *L;
+  if (c2m_ctx->lua_state == NULL) {
+    L = luaL_newstate ();
+    luaL_openlibs (L);
+    register_ast_bindings (L, c2m_ctx);
+    c2m_ctx->lua_state = L;
+  } else {
+    L = (lua_State *) c2m_ctx->lua_state;
+  }
+
+  /* update the shared pos box in place -- see register_ast_bindings */
+  lua_getfield (L, LUA_REGISTRYINDEX, REGKEY_POS);
+  pos_t *pos_box = (pos_t *) lua_touserdata (L, -1);
+  lua_pop (L, 1);
+  *pos_box = pos;
+
+  if (luaL_dostring (L, lua_src) != LUA_OK) {
+    error (c2m_ctx, pos, "lua macro error: %s", lua_tostring (L, -1));
+    lua_pop (L, 1); /* pop the error message, keep the VM alive for the rest of the TU */
+    return NULL;
+  }
+  return get_macro_result (L);
+  /* NB: no lua_close here anymore -- the state outlives this call.
+     Closed once in c2mir_compile's cleanup, see below. */
+}
+/* ====================== END LUA MACRO BINDINGS ======================= */
 
 static node_t get_op (node_t n, int nop) {
   n = NL_HEAD (n->u.ops);
@@ -1592,6 +1877,35 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
           return new_token (c2m_ctx, pos, "!", T_UNOP, N_NOT);
       }
       assert (FALSE);
+    case '@': {
+      pos = cs->pos;
+      curr_c = cs_get (c2m_ctx);
+      if (curr_c != '{') {
+        cs_unget (c2m_ctx, curr_c);
+        return new_token (c2m_ctx, pos, "@", '@', N_IGNORE);
+      }
+      int depth = 1;
+      VARR_TRUNC (char, symbol_text, 0);
+      for (;;) {
+        curr_c = cs_get (c2m_ctx);
+        if (curr_c == EOF) {
+          error (c2m_ctx, pos, "unterminated @{ } macro block");
+          break;
+        }
+        if (curr_c == '{') depth++;
+        else if (curr_c == '}') {
+          depth--;
+          if (depth == 0) break;
+        }
+        VARR_PUSH (char, symbol_text, curr_c);
+      }
+      VARR_PUSH (char, symbol_text, '\0');
+      {
+        node_t lua_result = eval_lua_macro (c2m_ctx, VARR_ADDR (char, symbol_text), pos);
+        if (lua_result == NULL) lua_result = new_pos_node (c2m_ctx, N_IGNORE, pos);
+        return new_node_token (c2m_ctx, pos, "<@macro>", T_LUA_MACRO, lua_result);
+      }
+    }
     case ';': return new_token (c2m_ctx, cs->pos, ";", curr_c, N_IGNORE);
     case '?': return new_token (c2m_ctx, cs->pos, "?", curr_c, N_IGNORE);
     case '(': return new_token (c2m_ctx, cs->pos, "(", curr_c, N_IGNORE);
@@ -4338,7 +4652,7 @@ D (primary_expr) {
   node_t r, n, op, gn, list;
   pos_t pos;
 
-  if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
+  if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r) || MN (T_LUA_MACRO, r)) {
     return r;
   } else if (MP (T_ANDAND, pos)) {
     PTN (T_ID);
@@ -5643,7 +5957,14 @@ D (compound_stmt) {
   n->attr = curr_scope;
   curr_scope = n;
   while (!C ('}') && !C (T_EOFILE)) { /* block-item-list, block_item */
-    if ((r = TRY (declaration)) != err_node) {
+    if (C (T_LUA_MACRO)) {
+      /* bare @{ } in statement position: splice directly, no trailing ';'.
+         op_flat_append unpacks N_LIST results into individual sibling
+         statements -- same mechanism `declaration` already relies on
+         for `int a, b, c;` producing multiple decls from one production. */
+      r = curr_token->node;
+      read_token (c2m_ctx);
+    } else if ((r = TRY (declaration)) != err_node) {
     } else {
       PE (stmt, err1);
     }
@@ -5672,7 +5993,12 @@ D (transl_unit) {
   read_token (c2m_ctx);
   list = new_node (c2m_ctx, N_LIST);
   while (!C (T_EOFILE)) { /* external-declaration */
-    if ((r = TRY (declaration)) != err_node) {
+    if (C (T_LUA_MACRO)) {
+      /* bare @{ } at file scope -- e.g. to generate several function/decl
+         nodes at once. Same op_flat_append splice as compound_stmt. */
+      r = curr_token->node;
+      read_token (c2m_ctx);
+    } else if ((r = TRY (declaration)) != err_node) {
     } else {
       PAE (declaration_specs, (node_t) 1, err);
       ds = r;
@@ -14897,6 +15223,10 @@ static void compile_init (c2m_ctx_t c2m_ctx, struct c2mir_options *ops, int (*ge
 }
 
 static void compile_finish (c2m_ctx_t c2m_ctx) {
+  if (c2m_ctx->lua_state != NULL) {
+    lua_close ((lua_State *) c2m_ctx->lua_state);
+    c2m_ctx->lua_state = NULL;
+  }
   if (symbol_text != NULL) VARR_DESTROY (char, symbol_text);
   if (temp_string != NULL) VARR_DESTROY (char, temp_string);
   if (node_positions != NULL) VARR_DESTROY (pos_t, node_positions);

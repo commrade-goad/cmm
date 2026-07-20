@@ -585,6 +585,7 @@ typedef enum {
   T___TYPE_OF, /* extension: __type_of(expr) -> const __type_t * */
   T___FRESH__, /* extension: __fresh__ - hygienic macro temp identifier */
   T_COLASSIGN, /* extension: ':=' for auto type inference declarations */
+  T_DEREFOP,   /* extension: '.*' postfix pointer dereference, e.g. `ptr.*` == `*ptr` */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -900,6 +901,7 @@ static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
   case T_UNOP: return "unary op";
   case T_DOTS: return "...";
   case T_COLASSIGN: return ":=";
+  case T_DEREFOP: return ".*";
   default:
     if ((s = str_find_by_key (c2m_ctx, token_code)) != NULL) return s;
     if (isprint (token_code))
@@ -1654,6 +1656,8 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
           cs_unget (c2m_ctx, curr_c);
           return new_token (c2m_ctx, pos, ".", '.', N_FIELD);
         }
+      } else if (curr_c == '*') {
+        return new_token (c2m_ctx, pos, ".*", T_DEREFOP, N_DEREF);
       } else if (!isdigit (curr_c)) {
         cs_unget (c2m_ctx, curr_c);
         return new_token (c2m_ctx, pos, ".", '.', N_FIELD);
@@ -4395,6 +4399,11 @@ DA (post_expr_part) {
   for (;;) {
     if (MC (T_INCDEC, pos, code)) {
       code = code == N_INC ? N_POST_INC : N_POST_DEC;
+      op = r;
+      r = NULL;
+    } else if (MC (T_DEREFOP, pos, code)) {
+      /* `ptr.*` postfix dereference, equivalent to `*ptr` but usable in
+         statement contexts without parens, e.g. `if ptr.* == 0 {...}` */
       op = r;
       r = NULL;
     } else if (MC ('.', pos, code) || MC (T_ARROW, pos, code)) {

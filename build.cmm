@@ -8,7 +8,7 @@
 const char *cflags[] = {
     "-I.", "-MMD", "-MP", "-fPIC", "-g", "-std=gnu11",
     "-Wno-abi", "-fsigned-char", "-fno-tree-sra", "-fno-ipa-cp-clone",
-    "-O3", "-DNDEBUG", "-DC2MIR_PARALLEL",
+    "-O2", "-DNDEBUG", "-DC2MIR_PARALLEL",
 };
 const int ncflags = sizeof cflags / sizeof cflags[0];
 
